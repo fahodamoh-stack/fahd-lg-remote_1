@@ -1,0 +1,10 @@
+﻿.venv/
+.venv-build/
+__pycache__/
+*.pyc
+.buildozer/
+bin/
+*.zip
+crash.txt
+main_*backup*
+main_before_*.py

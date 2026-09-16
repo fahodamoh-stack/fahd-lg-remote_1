@@ -9,17 +9,64 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
-      - name: Checkout
+      - name: Checkout project
         uses: actions/checkout@v4
 
-      - name: Build APK
-        uses: ArtemSBulgakov/buildozer-action@v1
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
         with:
-          command: buildozer android debug
-          buildozer_version: stable
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git \
+            zip \
+            unzip \
+            autoconf \
+            automake \
+            libtool \
+            pkg-config \
+            zlib1g-dev \
+            libncurses-dev \
+            cmake \
+            libffi-dev \
+            libssl-dev
+
+      - name: Install Buildozer
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install "cython<3" buildozer
+
+      - name: Show build configuration
+        run: |
+          python --version
+          java -version
+          buildozer --version
+          ls -la
+          cat buildozer.spec
+
+      - name: Build APK
+        env:
+          BUILDOZER_WARN_ON_ROOT: "0"
+        run: |
+          yes | buildozer android debug || buildozer android debug
+
+      - name: List APK files
+        if: always()
+        run: |
+          find . -type f -name "*.apk" -print || true
+          ls -lah bin/ || true
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
@@ -27,3 +74,4 @@ jobs:
           name: Fahd-LG-Remote-APK
           path: bin/*.apk
           if-no-files-found: error
+          retention-days: 7

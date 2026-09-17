@@ -2,80 +2,46 @@
 
 on:
   push:
-    branches:
-      - main
-
-  pull_request:
-    branches:
-      - main
-
+    branches: [main]
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-22.04
 
-    timeout-minutes: 90
-
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Java 17
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: '17'
 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-
-      - name: Install Linux dependencies
+      - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            git \
-            zip \
-            unzip \
-            autoconf \
-            libtool \
-            pkg-config \
-            zlib1g-dev \
-            libncurses5-dev \
-            libncursesw5-dev \
-            libtinfo6 \
-            cmake \
-            libffi-dev \
-            libssl-dev \
-            automake \
-            gettext
+            git zip unzip autoconf libtool pkg-config \
+            zlib1g-dev libncurses5-dev libncursesw5-dev \
+            libtinfo6 cmake libffi-dev libssl-dev
+          python -m pip install --upgrade pip
+          pip install buildozer cython==0.29.36
 
-      - name: Install Buildozer
+      - name: Clean and Build APK
         run: |
-          python -m pip install --upgrade pip setuptools wheel
-          python -m pip install buildozer cython
-
-      - name: Show tool versions
-        run: |
-          python --version
-          java -version
-          buildozer --version
-
-      - name: Build APK
-        run: |
-          buildozer android debug
-
-      - name: Show APK files
-        if: always()
-        run: |
-          find bin -maxdepth 2 -type f -name "*.apk" -print 2>/dev/null || true
+          rm -rf .buildozer
+          buildozer -v android debug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: fahd-lg-remote-apk
+          name: fahd-lg-remote
           path: bin/*.apk
           if-no-files-found: error

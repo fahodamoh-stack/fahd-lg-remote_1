@@ -1,940 +1,49 @@
-# -*- coding: utf-8 -*-
-
-import json
-import math
+﻿import json
 import os
 import socket
 import ssl
 import threading
 import time
-from pathlib import Path
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 import websocket
 
-from kivy.app import App
 from kivy.animation import Animation
+from kivy.app import App
 from kivy.clock import Clock
 from kivy.core.window import Window
-from kivy.graphics import (
-    Color,
-    Ellipse,
-    Line,
-    Rectangle,
-    RoundedRectangle,
-)
+from kivy.graphics import Color, RoundedRectangle, Line, Ellipse
 from kivy.metrics import dp, sp
 from kivy.properties import (
     BooleanProperty,
+    ColorProperty,
     NumericProperty,
     StringProperty,
 )
 from kivy.uix.anchorlayout import AnchorLayout
 from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.button import Button
 from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.label import Label
-from kivy.uix.screenmanager import (
-    Screen,
-    ScreenManager,
-    SlideTransition,
-)
+from kivy.uix.screenmanager import Screen, ScreenManager, FadeTransition
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.textinput import TextInput
 from kivy.uix.widget import Widget
 
 
-# ============================================================
-# Desktop development preview
-# Android ignores the desktop window dimensions.
-# ============================================================
-
-if os.environ.get("ANDROID_ARGUMENT") is None:
-    Window.size = (390, 800)
-
-Window.clearcolor = (0.027, 0.035, 0.051, 1)
-
-
-APP_NAME = "Fahd Remote"
-
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = Path.home() / ".aether_lg_remote"
-CONFIG_FILE = DATA_DIR / "settings.json"
-
-
-# ============================================================
-# Helpers
-# ============================================================
-
-def hex_color(value, alpha=1.0):
-    value = value.strip().lstrip("#")
-
-    if len(value) != 6:
-        raise ValueError("Expected a 6-digit hex color")
-
-    return [
-        int(value[0:2], 16) / 255.0,
-        int(value[2:4], 16) / 255.0,
-        int(value[4:6], 16) / 255.0,
-        alpha,
-    ]
-
-
-def clamp(value, minimum, maximum):
-    return max(minimum, min(maximum, value))
-
-
-def ui(callback, *args):
-    Clock.schedule_once(lambda dt: callback(*args), 0)
-
-
-# ============================================================
-# Theme
-# ============================================================
-
-class Theme:
-    COLORS = {
-        "background": hex_color("#07090D"),
-        "surface": hex_color("#0E1117"),
-        "elevated": hex_color("#151922"),
-        "soft": hex_color("#1B2029"),
-
-        "text": hex_color("#E9EDF2"),
-        "secondary": hex_color("#A7ADB8"),
-        "muted": hex_color("#737B88"),
-
-        "border": hex_color("#252B35"),
-
-        "accent": hex_color("#8EA7C7"),
-        "accent_dark": hex_color("#536B89"),
-
-        "green": hex_color("#55C98A"),
-        "red": hex_color("#B94A55"),
-        "orange": hex_color("#C89658"),
-    }
-
-    @classmethod
-    def get(cls, name, alpha=None):
-        color = list(cls.COLORS[name])
-
-        if alpha is not None:
-            color[3] = alpha
-
-        return color
-
-
-# ============================================================
-# Persistent settings
-# ============================================================
-
-class SettingsStore:
-    def __init__(self):
-        self.lock = threading.RLock()
-
-        self.data = {
-            "client_keys": {},
-            "last_tv": None,
-            "user_name": "",
-        }
-
-        self.load()
-
-    def load(self):
-        try:
-            if not CONFIG_FILE.exists():
-                return
-
-            loaded = json.loads(
-                CONFIG_FILE.read_text(encoding="utf-8")
-            )
-
-            if isinstance(loaded, dict):
-                self.data.update(loaded)
-
-            if not isinstance(self.data.get("client_keys"), dict):
-                self.data["client_keys"] = {}
-
-        except Exception:
-            # A corrupt settings file must never prevent startup.
-            pass
-
-    def save(self):
-        with self.lock:
-            try:
-                DATA_DIR.mkdir(
-                    parents=True,
-                    exist_ok=True,
-                )
-
-                temp = CONFIG_FILE.with_suffix(".tmp")
-
-                temp.write_text(
-                    json.dumps(
-                        self.data,
-                        indent=2,
-                        ensure_ascii=False,
-                    ),
-                    encoding="utf-8",
-                )
-
-                temp.replace(CONFIG_FILE)
-
-            except Exception:
-                pass
-
-    def get(self, key, default=None):
-        with self.lock:
-            return self.data.get(key, default)
-
-    def set(self, key, value):
-        with self.lock:
-            self.data[key] = value
-
-        self.save()
-
-    def get_client_key(self, host):
-        with self.lock:
-            return self.data.get(
-                "client_keys",
-                {},
-            ).get(host)
-
-    def set_client_key(self, host, key):
-        with self.lock:
-            keys = self.data.setdefault(
-                "client_keys",
-                {},
-            )
-
-            keys[host] = key
-
-        self.save()
-
-
-# ============================================================
-# Base themed widgets
-# ============================================================
-
-class AppLabel(Label):
-    def __init__(self, **kwargs):
-        kwargs.setdefault("color", Theme.get("text"))
-        kwargs.setdefault("font_size", sp(14))
-        kwargs.setdefault("halign", "left")
-        kwargs.setdefault("valign", "middle")
-
-        super().__init__(**kwargs)
-
-        self.bind(
-            size=self._update_text_size
-        )
-
-    def _update_text_size(self, *_):
-        self.text_size = (
-            self.width,
-            None,
-        )
-
-
-class Surface(BoxLayout):
-    def __init__(
-        self,
-        surface="surface",
-        radius=22,
-        border=True,
-        **kwargs,
-    ):
-        super().__init__(**kwargs)
-
-        self._surface_name = surface
-        self._radius = dp(radius)
-        self._has_border = border
-
-        with self.canvas.before:
-            self._bg_color = Color(
-                *Theme.get(surface)
-            )
-
-            self._background = RoundedRectangle(
-                pos=self.pos,
-                size=self.size,
-                radius=[self._radius],
-            )
-
-            self._border_color = Color(
-                *Theme.get(
-                    "border",
-                    0.95 if border else 0,
-                )
-            )
-
-            self._border = Line(
-                rounded_rectangle=(
-                    self.x,
-                    self.y,
-                    self.width,
-                    self.height,
-                    self._radius,
-                ),
-                width=dp(1),
-            )
-
-        self.bind(
-            pos=self._sync_canvas,
-            size=self._sync_canvas,
-        )
-
-    def _sync_canvas(self, *_):
-        self._background.pos = self.pos
-        self._background.size = self.size
-
-        self._border.rounded_rectangle = (
-            self.x,
-            self.y,
-            self.width,
-            self.height,
-            self._radius,
-        )
-
-
-class PremiumButton(Widget):
-    text = StringProperty("")
-    accent = StringProperty("soft")
-    text_color_name = StringProperty("text")
-    disabled = BooleanProperty(False)
-    scale = NumericProperty(1.0)
-
-    def __init__(
-        self,
-        callback=None,
-        **kwargs,
-    ):
-        super().__init__(**kwargs)
-
-        self.callback = callback
-        self._pressed = False
-
-        if self.size_hint_y is None and not self.height:
-            self.height = dp(52)
-
-        with self.canvas.before:
-            self._glow_color = Color(0, 0, 0, 0)
-
-            self._glow = RoundedRectangle(
-                radius=[dp(18)]
-            )
-
-            self._shadow_color = Color(
-                0,
-                0,
-                0,
-                0.18,
-            )
-
-            self._shadow = RoundedRectangle(
-                radius=[dp(17)]
-            )
-
-            self._bg_color = Color(
-                *Theme.get(self.accent)
-            )
-
-            self._background = RoundedRectangle(
-                radius=[dp(17)]
-            )
-
-            self._border_color = Color(
-                *Theme.get("border")
-            )
-
-            self._border = Line(
-                width=dp(1),
-                rounded_rectangle=(
-                    0,
-                    0,
-                    1,
-                    1,
-                    dp(17),
-                ),
-            )
-
-        self.label = AppLabel(
-            text=self.text,
-            color=Theme.get(self.text_color_name),
-            font_size=sp(13),
-            bold=True,
-            halign="center",
-        )
-
-        self.add_widget(self.label)
-
-        self.bind(
-            text=self._sync_text,
-            pos=self._sync_geometry,
-            size=self._sync_geometry,
-            scale=self._sync_geometry,
-            accent=self._sync_colors,
-            text_color_name=self._sync_colors,
-        )
-
-        Clock.schedule_once(
-            lambda dt: self._sync_colors(),
-            0,
-        )
-
-    def _sync_text(self, *_):
-        self.label.text = self.text
-
-    def _sync_colors(self, *_):
-        self._bg_color.rgba = Theme.get(
-            self.accent
-        )
-
-        self.label.color = Theme.get(
-            self.text_color_name
-        )
-
-    def _sync_geometry(self, *_):
-        width = self.width * self.scale
-        height = self.height * self.scale
-
-        x = self.center_x - width / 2
-        y = self.center_y - height / 2
-
-        self._background.pos = (x, y)
-        self._background.size = (width, height)
-
-        self._shadow.pos = (
-            x,
-            y - dp(2),
-        )
-
-        self._shadow.size = (
-            width,
-            height,
-        )
-
-        self._glow.pos = (
-            x - dp(3),
-            y - dp(3),
-        )
-
-        self._glow.size = (
-            width + dp(6),
-            height + dp(6),
-        )
-
-        self._border.rounded_rectangle = (
-            x,
-            y,
-            width,
-            height,
-            dp(17),
-        )
-
-        self.label.pos = (
-            x,
-            y,
-        )
-
-        self.label.size = (
-            width,
-            height,
-        )
-
-    def press_visual(self):
-        Animation.cancel_all(
-            self,
-            "scale",
-        )
-
-        Animation(
-            scale=0.965,
-            duration=0.075,
-            t="out_quad",
-        ).start(self)
-
-    def release_visual(self):
-        Animation.cancel_all(
-            self,
-            "scale",
-        )
-
-        Animation(
-            scale=1,
-            duration=0.14,
-            t="out_back",
-        ).start(self)
-
-    def on_touch_down(self, touch):
-        if (
-            self.disabled
-            or not self.collide_point(*touch.pos)
-        ):
-            return super().on_touch_down(touch)
-
-        touch.grab(self)
-
-        self._pressed = True
-        self.press_visual()
-
-        if self.accent == "red":
-            self._glow_color.rgba = Theme.get(
-                "red",
-                0.12,
-            )
-
-        return True
-
-    def on_touch_up(self, touch):
-        if touch.grab_current is not self:
-            return super().on_touch_up(touch)
-
-        touch.ungrab(self)
-
-        was_inside = self.collide_point(
-            *touch.pos
-        )
-
-        self._pressed = False
-
-        self.release_visual()
-
-        Animation(
-            a=0,
-            duration=0.15,
-        ).start(self._glow_color)
-
-        if (
-            was_inside
-            and not self.disabled
-            and self.callback
-        ):
-            Clock.schedule_once(
-                lambda dt: self.callback(self),
-                0,
-            )
-
-        return True
-
-
-class PremiumInput(TextInput):
-    def __init__(self, **kwargs):
-        kwargs.setdefault("multiline", False)
-        kwargs.setdefault("font_size", sp(15))
-        kwargs.setdefault("write_tab", False)
-
-        super().__init__(**kwargs)
-
-        self.size_hint_y = None
-        self.height = dp(54)
-
-        self.background_normal = ""
-        self.background_active = ""
-
-        self.background_color = Theme.get("elevated")
-        self.foreground_color = Theme.get("text")
-        self.hint_text_color = Theme.get("muted")
-        self.cursor_color = Theme.get("accent")
-
-        self.padding = [
-            dp(16),
-            dp(14),
-        ]
-
-        self.readonly = False
-        self.disabled = False
-
-    def on_touch_down(self, touch):
-        if self.collide_point(*touch.pos):
-            self.focus = True
-
-        return super().on_touch_down(touch)
-
-
-
-# ============================================================
-# Canvas icons
-# ============================================================
-
-class NavIcon(Widget):
-    kind = StringProperty("home")
-    active = BooleanProperty(False)
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
-        with self.canvas:
-            self._color = Color(
-                *Theme.get("secondary")
-            )
-
-            self._line1 = Line(
-                width=dp(1.7)
-            )
-
-            self._line2 = Line(
-                width=dp(1.7)
-            )
-
-            self._circle = Line(
-                width=dp(1.7)
-            )
-
-        self.bind(
-            pos=self._draw,
-            size=self._draw,
-            kind=self._draw,
-            active=self._draw,
-        )
-
-    def _draw(self, *_):
-        self._color.rgba = Theme.get(
-            "accent" if self.active else "muted"
-        )
-
-        self._line1.points = []
-        self._line2.points = []
-        self._circle.circle = (
-            0,
-            0,
-            0,
-        )
-
-        cx = self.center_x
-        cy = self.center_y
-
-        s = min(
-            self.width,
-            self.height,
-        )
-
-        if self.kind == "home":
-            self._line1.points = [
-                cx - s * 0.28,
-                cy,
-                cx,
-                cy + s * 0.24,
-                cx + s * 0.28,
-                cy,
-            ]
-
-            self._line2.points = [
-                cx - s * 0.20,
-                cy,
-                cx - s * 0.20,
-                cy - s * 0.24,
-                cx + s * 0.20,
-                cy - s * 0.24,
-                cx + s * 0.20,
-                cy,
-            ]
-
-        elif self.kind == "remote":
-            self._line1.rounded_rectangle = (
-                cx - s * 0.18,
-                cy - s * 0.32,
-                s * 0.36,
-                s * 0.64,
-                dp(5),
-            )
-
-            self._circle.circle = (
-                cx,
-                cy + s * 0.14,
-                s * 0.06,
-            )
-
-        else:
-            self._circle.circle = (
-                cx,
-                cy,
-                s * 0.20,
-            )
-
-            self._line1.circle = (
-                cx,
-                cy,
-                s * 0.31,
-            )
-
-
-# ============================================================
-# Status indicator
-# ============================================================
-
-class StatusIndicator(Widget):
-    state = StringProperty("disconnected")
-    pulse = NumericProperty(0)
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
-        with self.canvas:
-            self._glow_color = Color(
-                0,
-                0,
-                0,
-                0,
-            )
-
-            self._glow = Ellipse()
-
-            self._ring_color = Color(
-                *Theme.get("border")
-            )
-
-            self._ring = Line(
-                width=dp(1.2),
-            )
-
-            self._dot_color = Color(
-                *Theme.get("muted")
-            )
-
-            self._dot = Ellipse()
-
-        self.bind(
-            pos=self._sync,
-            size=self._sync,
-            pulse=self._sync,
-            state=self._state_changed,
-        )
-
-        Clock.schedule_once(
-            lambda dt: self._state_changed(),
-            0,
-        )
-
-    def _sync(self, *_):
-        radius = min(
-            self.width,
-            self.height,
-        ) * 0.16
-
-        glow_radius = radius * (
-            2.1 + self.pulse * 0.35
-        )
-
-        self._glow.pos = (
-            self.center_x - glow_radius,
-            self.center_y - glow_radius,
-        )
-
-        self._glow.size = (
-            glow_radius * 2,
-            glow_radius * 2,
-        )
-
-        self._dot.pos = (
-            self.center_x - radius,
-            self.center_y - radius,
-        )
-
-        self._dot.size = (
-            radius * 2,
-            radius * 2,
-        )
-
-        self._ring.circle = (
-            self.center_x,
-            self.center_y,
-            radius * (
-                1.65 + self.pulse * 0.2
-            ),
-        )
-
-    def _state_changed(self, *_):
-        Animation.cancel_all(
-            self,
-            "pulse",
-        )
-
-        if self.state == "connected":
-            c = Theme.get("green")
-
-            self._dot_color.rgba = c
-            self._ring_color.rgba = Theme.get(
-                "green",
-                0.35,
-            )
-            self._glow_color.rgba = Theme.get(
-                "green",
-                0.09,
-            )
-
-            Animation(
-                pulse=0.65,
-                duration=0.32,
-                t="out_quad",
-            ).start(self)
-
-        elif self.state in (
-            "searching",
-            "connecting",
-        ):
-            self._dot_color.rgba = Theme.get(
-                "accent"
-            )
-
-            self._ring_color.rgba = Theme.get(
-                "accent",
-                0.38,
-            )
-
-            self._glow_color.rgba = Theme.get(
-                "accent",
-                0.07,
-            )
-
-            anim = (
-                Animation(
-                    pulse=1,
-                    duration=0.65,
-                    t="in_out_quad",
-                )
-                +
-                Animation(
-                    pulse=0,
-                    duration=0.65,
-                    t="in_out_quad",
-                )
-            )
-
-            anim.repeat = True
-            anim.start(self)
-
-        elif self.state == "error":
-            self._dot_color.rgba = Theme.get(
-                "red"
-            )
-
-            self._ring_color.rgba = Theme.get(
-                "red",
-                0.32,
-            )
-
-            self._glow_color.rgba = Theme.get(
-                "red",
-                0.06,
-            )
-
-        else:
-            self._dot_color.rgba = Theme.get(
-                "muted"
-            )
-
-            self._ring_color.rgba = Theme.get(
-                "border"
-            )
-
-            self._glow_color.rgba = [
-                0,
-                0,
-                0,
-                0,
-            ]
-
-
-# ============================================================
-# Loading indicator
-# ============================================================
-
-class LoadingRing(Widget):
-    angle = NumericProperty(0)
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
-        self.running = False
-
-        with self.canvas:
-            self._track_color = Color(
-                *Theme.get("border")
-            )
-
-            self._track = Line(
-                width=dp(2),
-            )
-
-            self._arc_color = Color(
-                *Theme.get("accent")
-            )
-
-            self._arc = Line(
-                width=dp(2.2),
-            )
-
-        self.bind(
-            pos=self._sync,
-            size=self._sync,
-            angle=self._sync,
-        )
-
-    def _sync(self, *_):
-        radius = max(
-            dp(5),
-            min(
-                self.width,
-                self.height,
-            ) / 2 - dp(4),
-        )
-
-        self._track.circle = (
-            self.center_x,
-            self.center_y,
-            radius,
-            0,
-            360,
-        )
-
-        self._arc.circle = (
-            self.center_x,
-            self.center_y,
-            radius,
-            self.angle,
-            self.angle + 92,
-        )
-
-    def start(self):
-        self.running = True
-
-        Animation.cancel_all(
-            self,
-            "angle",
-        )
-
-        self.angle = 0
-
-        anim = Animation(
-            angle=360,
-            duration=0.85,
-            t="linear",
-        )
-
-        anim.repeat = True
-        anim.start(self)
-
-    def stop(self):
-        self.running = False
-
-        Animation.cancel_all(
-            self,
-            "angle",
-        )
-
-
-# ============================================================
-# LG webOS communication
-# ============================================================
-
-class LGWebOSClient:
-    """
-    Real LG webOS SSAP client.
-
-    UI callbacks are always scheduled back onto Kivy's UI thread.
-    Network work never runs on Kivy's main thread.
-    """
-
-    REGISTER_MANIFEST = {
+APP_TITLE = "FAHD REMOTE"
+APP_ID = "fahd.remote"
+
+SSDP_ADDRESS = "239.255.255.250"
+SSDP_PORT = 1900
+
+REGISTER_PAYLOAD = {
+    "forcePairing": False,
+    "pairingType": "PROMPT",
+    "manifest": {
         "manifestVersion": 1,
         "appVersion": "1.0",
         "signed": {
@@ -942,10 +51,10 @@ class LGWebOSClient:
             "appId": "com.lge.test",
             "vendorId": "com.lge",
             "localizedAppNames": {
-                "": "Fahd Remote"
+                "": "FAHD REMOTE"
             },
             "localizedVendorNames": {
-                "": "Fahd"
+                "": "Fahd LG Remote"
             },
             "permissions": [
                 "TEST_SECURE",
@@ -963,9 +72,9 @@ class LGWebOSClient:
                 "READ_UPDATE_INFO",
                 "UPDATE_FROM_REMOTE_APP",
                 "READ_LGE_TV_INPUT_EVENTS",
-                "READ_TV_CURRENT_TIME",
+                "READ_TV_CURRENT_TIME"
             ],
-            "serial": "2f930e2d2cfe083771f68e4fe7bb07",
+            "serial": "2f930e2d2cfe083771f68e4fe7bb07"
         },
         "permissions": [
             "LAUNCH",
@@ -990,2683 +99,1215 @@ class LGWebOSClient:
             "WRITE_NOTIFICATION_TOAST",
             "READ_POWER_STATE",
             "READ_COUNTRY_INFO",
+            "READ_SETTINGS",
+            "CONTROL_TV_SCREEN",
+            "CONTROL_TV_STANBY",
+            "CONTROL_FAVORITE_GROUP",
+            "CONTROL_USER_INFO",
+            "CHECK_BLUETOOTH_DEVICE",
+            "CONTROL_BLUETOOTH",
+            "CONTROL_TIMER_INFO",
+            "STB_INTERNAL_CONNECTION",
+            "CONTROL_RECORDING",
+            "READ_RECORDING_STATE",
+            "WRITE_RECORDING_LIST",
+            "READ_RECORDING_LIST",
+            "READ_RECORDING_SCHEDULE",
+            "WRITE_RECORDING_SCHEDULE",
+            "READ_STORAGE_DEVICE_LIST",
+            "READ_TV_PROGRAM_INFO",
+            "CONTROL_BOX_CHANNEL",
+            "READ_TV_ACR_AUTH_TOKEN",
+            "READ_TV_CONTENT_STATE",
+            "READ_TV_CURRENT_TIME",
+            "ADD_LAUNCHER_CHANNEL",
+            "SET_CHANNEL_SKIP",
+            "RELEASE_CHANNEL_SKIP",
+            "CONTROL_CHANNEL_BLOCK",
+            "DELETE_SELECT_CHANNEL",
+            "CONTROL_CHANNEL_GROUP",
+            "SCAN_TV_CHANNELS",
+            "CONTROL_TV_POWER",
+            "CONTROL_WOL"
         ],
+        "signatures": [
+            {
+                "signatureVersion": 1,
+                "signature": (
+                    "eyJhbGciOiJSUzI1NiIsImtpZCI6InRlc3QifQ."
+                    "eyJwZXJtaXNzaW9ucyI6W119.signature"
+                )
+            }
+        ]
+    }
+}
+
+
+class Design:
+    DARK = {
+        "background": [0.027, 0.035, 0.051, 1],
+        "surface": [0.055, 0.067, 0.09, 1],
+        "elevated": [0.082, 0.098, 0.133, 1],
+        "soft": [0.106, 0.125, 0.161, 1],
+        "text": [0.925, 0.941, 0.961, 1],
+        "secondary": [0.655, 0.678, 0.722, 1],
+        "muted": [0.451, 0.482, 0.533, 1],
+        "border": [0.145, 0.169, 0.208, 1],
+        "accent": [0.557, 0.655, 0.78, 1],
+        "green": [0.333, 0.788, 0.541, 1],
+        "red": [0.725, 0.29, 0.333, 1],
     }
 
-    def __init__(
-        self,
-        settings,
-        state_callback=None,
-    ):
-        self.settings = settings
-        self.state_callback = state_callback
+    LIGHT = {
+        "background": [0.945, 0.953, 0.965, 1],
+        "surface": [0.985, 0.989, 0.996, 1],
+        "elevated": [1, 1, 1, 1],
+        "soft": [0.91, 0.925, 0.945, 1],
+        "text": [0.075, 0.09, 0.12, 1],
+        "secondary": [0.28, 0.32, 0.38, 1],
+        "muted": [0.46, 0.49, 0.55, 1],
+        "border": [0.82, 0.84, 0.88, 1],
+        "accent": [0.31, 0.46, 0.66, 1],
+        "green": [0.18, 0.62, 0.38, 1],
+        "red": [0.67, 0.22, 0.28, 1],
+    }
 
-        self.host = None
-        self.tv_name = None
+    MICRO = 0.12
+    FAST = 0.18
+    NORMAL = 0.28
+    SCREEN = 0.32
+    RADIUS = dp(18)
+    SMALL_RADIUS = dp(12)
 
-        self.ws = None
-        self.pointer_ws = None
 
-        self.connected = False
+class SettingsStore:
+    def __init__(self, filename):
+        self.filename = filename
+        self.lock = threading.RLock()
+        self.data = {
+            "name": "",
+            "theme": "dark",
+            "last_tv": "",
+            "last_tv_name": "",
+            "client_keys": {},
+        }
+        self.load()
 
-        # SSAP replies must not be consumed by multiple threads.
-        # Every request is serialized through this lock.
-        self.request_lock = threading.RLock()
+    def load(self):
+        with self.lock:
+            try:
+                if os.path.isfile(self.filename):
+                    with open(self.filename, "r", encoding="utf-8") as handle:
+                        loaded = json.load(handle)
+                    if isinstance(loaded, dict):
+                        for key in self.data:
+                            if key in loaded:
+                                self.data[key] = loaded[key]
+                if not isinstance(self.data.get("client_keys"), dict):
+                    self.data["client_keys"] = {}
+            except (OSError, ValueError, TypeError):
+                pass
 
-        self.pointer_lock = threading.RLock()
-        self.connection_lock = threading.RLock()
-
-        self.request_counter = 0
-
-    def _emit(
-        self,
-        state,
-        message="",
-    ):
-        if self.state_callback:
-            ui(
-                self.state_callback,
-                state,
-                message,
-            )
-
-    @staticmethod
-    def discover(timeout=3.4):
-        """
-        SSDP discovery for LG webOS TVs.
-        """
-
-        targets = [
-            "urn:lge-com:service:webos-second-screen:1",
-            "urn:schemas-upnp-org:device:MediaRenderer:1",
-            "ssdp:all",
-        ]
-
-        devices = {}
-
-        sock = socket.socket(
-            socket.AF_INET,
-            socket.SOCK_DGRAM,
-            socket.IPPROTO_UDP,
-        )
-
-        try:
-            sock.setsockopt(
-                socket.SOL_SOCKET,
-                socket.SO_REUSEADDR,
-                1,
-            )
-
-            sock.settimeout(0.25)
-
-            for target in targets:
-                packet = (
-                    "M-SEARCH * HTTP/1.1\r\n"
-                    "HOST: 239.255.255.250:1900\r\n"
-                    'MAN: "ssdp:discover"\r\n'
-                    "MX: 2\r\n"
-                    f"ST: {target}\r\n"
-                    "\r\n"
-                ).encode("utf-8")
-
+    def save(self):
+        with self.lock:
+            folder = os.path.dirname(self.filename)
+            if folder:
+                os.makedirs(folder, exist_ok=True)
+            temp = self.filename + ".tmp"
+            try:
+                with open(temp, "w", encoding="utf-8") as handle:
+                    json.dump(self.data, handle, indent=2)
+                    handle.flush()
+                    try:
+                        os.fsync(handle.fileno())
+                    except OSError:
+                        pass
+                os.replace(temp, self.filename)
+            except OSError:
                 try:
-                    sock.sendto(
-                        packet,
-                        (
-                            "239.255.255.250",
-                            1900,
-                        ),
-                    )
+                    if os.path.exists(temp):
+                        os.remove(temp)
                 except OSError:
                     pass
 
+    def get(self, key, default=None):
+        with self.lock:
+            return self.data.get(key, default)
+
+    def set(self, key, value):
+        with self.lock:
+            self.data[key] = value
+        self.save()
+
+    def client_key(self, host):
+        with self.lock:
+            return self.data.get("client_keys", {}).get(host)
+
+    def set_client_key(self, host, key):
+        with self.lock:
+            keys = self.data.setdefault("client_keys", {})
+            keys[host] = key
+        self.save()
+
+
+class WebOSTV:
+    def __init__(self, store, state_callback=None):
+        self.store = store
+        self.state_callback = state_callback
+        self.host = None
+        self.ws = None
+        self.pointer_ws = None
+
+        self.main_lock = threading.RLock()
+        self.pointer_lock = threading.RLock()
+        self.lifecycle_lock = threading.RLock()
+
+        self.connected = False
+        self.stop_event = threading.Event()
+        self.request_counter = 0
+
+    def _state(self, value, message=""):
+        callback = self.state_callback
+        if callback:
+            Clock.schedule_once(
+                lambda _dt: callback(value, message), 0
+            )
+
+    def _next_id(self):
+        self.request_counter += 1
+        return "fahd-{}".format(self.request_counter)
+
+    def _create_websocket(self, url, timeout=8):
+        options = {
+            "timeout": timeout,
+            "enable_multithread": True,
+        }
+        if url.startswith("wss://"):
+            options["sslopt"] = {
+                "cert_reqs": ssl.CERT_NONE,
+                "check_hostname": False,
+            }
+        return websocket.create_connection(url, **options)
+
+    def connect(self, host):
+        with self.lifecycle_lock:
+            self.disconnect(notify=False)
+            self.stop_event.clear()
+            self.host = host
+            self._state("connecting", "Connecting to LG webOS TV")
+
+            errors = []
+
+            for url in (
+                "wss://{}:3001/".format(host),
+                "ws://{}:3000/".format(host),
+            ):
+                try:
+                    ws = self._create_websocket(url, timeout=8)
+                    self.ws = ws
+                    self._register()
+                    self.connected = True
+                    self._connect_pointer()
+                    self._state("connected", "Connected")
+                    return True
+                except Exception as exc:
+                    errors.append(str(exc))
+                    self._close_main()
+
+            self.connected = False
+            message = errors[-1] if errors else "Unable to connect"
+            self._state("error", message)
+            return False
+
+    def _register(self):
+        if not self.ws:
+            raise RuntimeError("WebSocket is not connected")
+
+        payload = json.loads(json.dumps(REGISTER_PAYLOAD))
+        key = self.store.client_key(self.host)
+        if key:
+            payload["client-key"] = key
+
+        message = {
+            "id": "register_0",
+            "type": "register",
+            "payload": payload,
+        }
+
+        with self.main_lock:
+            self.ws.settimeout(45)
+            self.ws.send(json.dumps(message))
+
+            deadline = time.monotonic() + 45
+            while time.monotonic() < deadline:
+                raw = self.ws.recv()
+                if not raw:
+                    continue
+                response = json.loads(raw)
+                response_type = response.get("type")
+
+                if response_type == "registered":
+                    client_key = response.get("payload", {}).get(
+                        "client-key"
+                    )
+                    if client_key:
+                        self.store.set_client_key(
+                            self.host, client_key
+                        )
+                    self.ws.settimeout(8)
+                    return
+
+                if response_type == "error":
+                    raise RuntimeError(
+                        response.get("error", "LG registration failed")
+                    )
+
+            raise TimeoutError("LG pairing timed out")
+
+    def request(self, uri, payload=None, timeout=8):
+        if not self.connected or not self.ws:
+            raise RuntimeError("TV is not connected")
+
+        request_id = self._next_id()
+        message = {
+            "id": request_id,
+            "type": "request",
+            "uri": uri,
+            "payload": payload or {},
+        }
+
+        with self.main_lock:
+            self.ws.settimeout(timeout)
+            self.ws.send(json.dumps(message))
             deadline = time.monotonic() + timeout
 
             while time.monotonic() < deadline:
-                try:
-                    data, address = sock.recvfrom(
-                        65535
-                    )
-
-                except socket.timeout:
+                raw = self.ws.recv()
+                if not raw:
                     continue
 
+                response = json.loads(raw)
+                if response.get("id") != request_id:
+                    continue
+
+                if response.get("type") == "error":
+                    raise RuntimeError(
+                        response.get("error", "LG request failed")
+                    )
+
+                return response.get("payload", {})
+
+        raise TimeoutError("LG request timed out")
+
+    def _connect_pointer(self):
+        result = self.request(
+            "ssap://com.webos.service.networkinput/"
+            "getPointerInputSocket"
+        )
+        socket_path = result.get("socketPath")
+        if not socket_path:
+            raise RuntimeError("TV did not return pointer socket")
+
+        with self.pointer_lock:
+            self._close_pointer()
+            self.pointer_ws = self._create_websocket(
+                socket_path, timeout=6
+            )
+
+    def _pointer_send(self, message):
+        if not self.connected:
+            raise RuntimeError("TV is not connected")
+
+        with self.pointer_lock:
+            if not self.pointer_ws:
+                self._connect_pointer()
+
+            try:
+                self.pointer_ws.send(message)
+            except Exception:
+                self._close_pointer()
+                self._connect_pointer()
+                self.pointer_ws.send(message)
+
+    def move_pointer(self, dx, dy):
+        dx = int(max(-500, min(500, dx)))
+        dy = int(max(-500, min(500, dy)))
+        message = (
+            "type:move\n"
+            "dx:{}\n"
+            "dy:{}\n"
+            "down:0\n\n"
+        ).format(dx, dy)
+        self._pointer_send(message)
+
+    def click(self):
+        self._pointer_send("type:click\n\n")
+
+    def button(self, key):
+        safe_keys = {
+            "UP", "DOWN", "LEFT", "RIGHT", "ENTER",
+            "BACK", "HOME", "PLAY", "MUTE",
+        }
+        if key not in safe_keys:
+            raise ValueError("Unsupported pointer button")
+        self._pointer_send(
+            "type:button\nname:{}\n\n".format(key)
+        )
+
+    def volume_up(self):
+        return self.request("ssap://audio/volumeUp")
+
+    def volume_down(self):
+        return self.request("ssap://audio/volumeDown")
+
+    def get_audio_status(self):
+        return self.request("ssap://audio/getStatus")
+
+    def set_mute(self, muted):
+        return self.request(
+            "ssap://audio/setMute",
+            {"mute": bool(muted)}
+        )
+
+    def toggle_mute(self):
+        status = self.get_audio_status()
+        muted = bool(status.get("mute", False))
+        return self.set_mute(not muted)
+
+    def power_off(self):
+        return self.request("ssap://system/turnOff")
+
+    def _close_pointer(self):
+        ws = self.pointer_ws
+        self.pointer_ws = None
+        if ws:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+    def _close_main(self):
+        ws = self.ws
+        self.ws = None
+        if ws:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+    def disconnect(self, notify=True):
+        self.stop_event.set()
+        self.connected = False
+
+        with self.pointer_lock:
+            self._close_pointer()
+
+        with self.main_lock:
+            self._close_main()
+
+        if notify:
+            self._state("disconnected", "Disconnected")
+
+
+class SSDPDiscovery:
+    SEARCH_TARGETS = (
+        "urn:lge-com:service:webos-second-screen:1",
+        "urn:schemas-upnp-org:device:MediaRenderer:1",
+    )
+
+    def __init__(self):
+        self.stop_event = threading.Event()
+
+    def stop(self):
+        self.stop_event.set()
+
+    @staticmethod
+    def _parse_headers(data):
+        try:
+            text = data.decode("utf-8", errors="ignore")
+        except Exception:
+            return {}
+
+        headers = {}
+        lines = text.replace("\r\n", "\n").split("\n")
+        for line in lines[1:]:
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            headers[key.strip().lower()] = value.strip()
+        return headers
+
+    @staticmethod
+    def _host_from_location(location, fallback):
+        try:
+            parsed = urlparse(location)
+            if parsed.hostname:
+                return parsed.hostname
+        except Exception:
+            pass
+        return fallback
+
+    @staticmethod
+    def _friendly_name(location, host):
+        if not location:
+            return "LG webOS TV"
+        try:
+            request = Request(
+                location,
+                headers={"User-Agent": "FAHD-REMOTE/1.0"}
+            )
+            with urlopen(request, timeout=1.5) as response:
+                body = response.read(65536).decode(
+                    "utf-8", errors="ignore"
+                )
+
+            lower = body.lower()
+            start_tag = "<friendlyname>"
+            end_tag = "</friendlyname>"
+            start = lower.find(start_tag)
+            end = lower.find(end_tag)
+
+            if start != -1 and end > start:
+                start += len(start_tag)
+                value = body[start:end].strip()
+                if value:
+                    return value
+        except Exception:
+            pass
+        return "LG webOS TV ({})".format(host)
+
+    def discover(self, result_callback, done_callback, timeout=4.0):
+        self.stop_event.clear()
+        seen = set()
+
+        try:
+            sock = socket.socket(
+                socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP
+            )
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.settimeout(0.25)
+
+            for target in self.SEARCH_TARGETS:
+                message = (
+                    "M-SEARCH * HTTP/1.1\r\n"
+                    "HOST:239.255.255.250:1900\r\n"
+                    'MAN:"ssdp:discover"\r\n'
+                    "MX:2\r\n"
+                    "ST:{}\r\n"
+                    "\r\n"
+                ).format(target)
+
+                try:
+                    sock.sendto(
+                        message.encode("ascii"),
+                        (SSDP_ADDRESS, SSDP_PORT),
+                    )
+                except OSError:
+                    continue
+
+            deadline = time.monotonic() + timeout
+
+            while (
+                time.monotonic() < deadline
+                and not self.stop_event.is_set()
+            ):
+                try:
+                    data, address = sock.recvfrom(65535)
+                except socket.timeout:
+                    continue
                 except OSError:
                     break
 
-                raw = data.decode(
-                    "utf-8",
-                    errors="ignore",
+                headers = self._parse_headers(data)
+                server = headers.get("server", "").lower()
+                location = headers.get("location", "")
+                text = data.decode("utf-8", errors="ignore").lower()
+
+                looks_like_lg = (
+                    "webos" in server
+                    or "lge" in server
+                    or "webos" in text
+                    or "lge" in text
                 )
-
-                lower = raw.lower()
-
-                # Avoid showing every UPnP device in the house.
-                looks_like_lg = any(
-                    token in lower
-                    for token in (
-                        "webos",
-                        "lge",
-                        "lg electronics",
-                        "webos-second-screen",
-                    )
-                )
-
                 if not looks_like_lg:
                     continue
 
-                headers = {}
+                host = self._host_from_location(
+                    location, address[0]
+                )
+                if host in seen:
+                    continue
 
-                for line in raw.splitlines():
-                    if ":" not in line:
-                        continue
-
-                    key, value = line.split(
-                        ":",
-                        1,
-                    )
-
-                    headers[
-                        key.strip().lower()
-                    ] = value.strip()
-
-                host = address[0]
-
-                name = (
-                    headers.get("friendlyname")
-                    or headers.get("server")
-                    or "LG webOS TV"
+                seen.add(host)
+                friendly_name = self._friendly_name(
+                    location, host
                 )
 
-                devices[host] = {
-                    "host": host,
-                    "name": name,
-                    "location": headers.get(
-                        "location",
-                        "",
-                    ),
-                }
+                Clock.schedule_once(
+                    lambda _dt, h=host, n=friendly_name:
+                    result_callback(h, n),
+                    0,
+                )
 
         finally:
             try:
                 sock.close()
             except Exception:
                 pass
+            Clock.schedule_once(lambda _dt: done_callback(), 0)
 
-        return list(devices.values())
 
-    def connect_async(
-        self,
-        host,
-        name=None,
-    ):
-        if not host:
-            return
+class ThemeManager:
+    def __init__(self, store):
+        self.store = store
+        self.mode = store.get("theme", "dark")
+        if self.mode not in ("dark", "light"):
+            self.mode = "dark"
+        self.listeners = []
 
-        threading.Thread(
-            target=self._connect_worker,
-            args=(
-                host.strip(),
-                name,
-            ),
-            daemon=True,
-            name="lg-connect",
-        ).start()
-
-    def _open_control_socket(self, host):
-        """
-        Newer TVs normally use TLS :3001.
-        Older models may use ws://:3000.
-
-        webOS generally uses a self-signed TLS certificate, therefore
-        certificate verification cannot be used without installing the
-        TV certificate as a trust anchor.
-        """
-
-        attempts = [
-            (
-                f"wss://{host}:3001/",
-                {
-                    "cert_reqs": ssl.CERT_NONE,
-                    "check_hostname": False,
-                },
-            ),
-            (
-                f"ws://{host}:3000/",
-                None,
-            ),
-        ]
-
-        last_error = None
-
-        for url, ssl_options in attempts:
-            try:
-                kwargs = {
-                    "timeout": 8,
-                }
-
-                if ssl_options is not None:
-                    kwargs["sslopt"] = ssl_options
-
-                ws = websocket.create_connection(
-                    url,
-                    **kwargs,
-                )
-
-                ws.settimeout(8)
-
-                return ws
-
-            except Exception as error:
-                last_error = error
-
-        if last_error:
-            raise last_error
-
-        raise ConnectionError(
-            "Unable to open the webOS socket"
-        )
-
-    def _connect_worker(
-        self,
-        host,
-        name=None,
-    ):
-        with self.connection_lock:
-            self.disconnect(
-                emit=False
-            )
-
-            self._emit(
-                "connecting",
-                "Connecting to TV...",
-            )
-
-            control = None
-
-            try:
-                control = self._open_control_socket(
-                    host
-                )
-
-                client_key = (
-                    self.settings.get_client_key(
-                        host
-                    )
-                )
-
-                payload = {
-                    "type": "register",
-                    "id": "register_0",
-                    "payload": {
-                        "forcePairing": False,
-                        "pairingType": "PROMPT",
-                        "manifest": self.REGISTER_MANIFEST,
-                    },
-                }
-
-                if client_key:
-                    payload["payload"][
-                        "client-key"
-                    ] = client_key
-
-                control.send(
-                    json.dumps(payload)
-                )
-
-                deadline = (
-                    time.monotonic()
-                    + 30
-                )
-
-                registered = False
-                new_key = None
-
-                while (
-                    time.monotonic()
-                    < deadline
-                ):
-                    try:
-                        raw = control.recv()
-
-                    except websocket.WebSocketTimeoutException:
-                        continue
-
-                    if not raw:
-                        continue
-
-                    reply = json.loads(raw)
-
-                    reply_type = reply.get(
-                        "type"
-                    )
-
-                    if reply_type == "registered":
-                        registered = True
-
-                        new_key = (
-                            reply.get(
-                                "payload",
-                                {},
-                            ).get(
-                                "client-key"
-                            )
-                        )
-
-                        break
-
-                    if reply_type == "error":
-                        raise ConnectionError(
-                            reply.get(
-                                "error",
-                                "Pairing rejected",
-                            )
-                        )
-
-                if not registered:
-                    raise TimeoutError(
-                        "Pairing timed out. Accept the pairing request on the TV."
-                    )
-
-                with self.request_lock:
-                    self.ws = control
-                    self.host = host
-                    self.tv_name = (
-                        name
-                        or "LG webOS TV"
-                    )
-                    self.connected = True
-
-                if new_key:
-                    self.settings.set_client_key(
-                        host,
-                        new_key,
-                    )
-
-                self.settings.set(
-                    "last_tv",
-                    {
-                        "host": host,
-                        "name": self.tv_name,
-                    },
-                )
-
-                self._emit(
-                    "connected",
-                    "Connected",
-                )
-
-                self._setup_pointer()
-
-            except Exception as error:
-                try:
-                    if control:
-                        control.close()
-                except Exception:
-                    pass
-
-                with self.request_lock:
-                    self.ws = None
-                    self.connected = False
-
-                self._emit(
-                    "error",
-                    self._friendly_error(
-                        error
-                    ),
-                )
-
-    @staticmethod
-    def _friendly_error(error):
-        text = str(error).strip()
-
-        lower = text.lower()
-
-        if isinstance(
-            error,
-            TimeoutError,
-        ):
-            return text
-
-        if (
-            "timed out" in lower
-            or "timeout" in lower
-        ):
-            return (
-                "Connection timed out. "
-                "Make sure the TV is on and connected to the same network."
-            )
-
-        if "refused" in lower:
-            return (
-                "Connection refused. "
-                "Check LG TV network and mobile-app connection settings."
-            )
-
-        if not text:
-            return "Could not connect to the TV."
-
+    @property
+    def palette(self):
         return (
-            "Connection failed: "
-            + text[:120]
+            Design.LIGHT
+            if self.mode == "light"
+            else Design.DARK
         )
 
-    def _next_request_id(self):
-        self.request_counter += 1
-        return (
-            f"aether_{self.request_counter}"
-        )
+    def bind(self, widget):
+        if widget not in self.listeners:
+            self.listeners.append(widget)
 
-    def request(
-        self,
-        uri,
-        payload=None,
-        timeout=6,
-    ):
-        """
-        Send a serialized SSAP request.
+    def unbind(self, widget):
+        if widget in self.listeners:
+            self.listeners.remove(widget)
 
-        Serialization is intentional. websocket-client does not provide
-        request/reply routing for LG's protocol.
-        """
+    def toggle(self):
+        self.mode = "light" if self.mode == "dark" else "dark"
+        self.store.set("theme", self.mode)
+        self.refresh(animated=True)
 
-        with self.request_lock:
-            if (
-                not self.connected
-                or not self.ws
-            ):
-                raise ConnectionError(
-                    "TV is not connected"
-                )
-
-            request_id = (
-                self._next_request_id()
-            )
-
-            message = {
-                "type": "request",
-                "id": request_id,
-                "uri": uri,
-                "payload": payload or {},
-            }
-
+    def refresh(self, animated=False):
+        for widget in self.listeners[:]:
             try:
-                self.ws.settimeout(
-                    timeout
+                widget.apply_theme(
+                    self.palette,
+                    animated=animated
                 )
-
-                self.ws.send(
-                    json.dumps(message)
-                )
-
-                deadline = (
-                    time.monotonic()
-                    + timeout
-                )
-
-                while (
-                    time.monotonic()
-                    < deadline
-                ):
-                    try:
-                        raw = self.ws.recv()
-
-                    except websocket.WebSocketTimeoutException:
-                        continue
-
-                    if not raw:
-                        continue
-
-                    reply = json.loads(
-                        raw
-                    )
-
-                    if (
-                        reply.get("id")
-                        != request_id
-                    ):
-                        continue
-
-                    if reply.get(
-                        "type"
-                    ) == "error":
-                        raise RuntimeError(
-                            reply.get(
-                                "error",
-                                "webOS request failed",
-                            )
-                        )
-
-                    return reply.get(
-                        "payload",
-                        {},
-                    )
-
-                raise TimeoutError(
-                    "TV request timed out"
-                )
-
-            except Exception:
-                # Do not incorrectly mark the TV disconnected for every
-                # unsupported SSAP command. Only socket-level failures
-                # should ultimately require reconnecting.
-                raise
-
-    def request_async(
-        self,
-        uri,
-        payload=None,
-        success=None,
-        failure=None,
-    ):
-        def worker():
-            try:
-                result = self.request(
-                    uri,
-                    payload,
-                )
-
-                if success:
-                    ui(
-                        success,
-                        result,
-                    )
-
-            except Exception as error:
-                if failure:
-                    ui(
-                        failure,
-                        error,
-                    )
-
-        threading.Thread(
-            target=worker,
-            daemon=True,
-            name="lg-request",
-        ).start()
-
-    def _setup_pointer(self):
-        try:
-            result = self.request(
-                "ssap://com.webos.service.networkinput/getPointerInputSocket",
-                timeout=6,
-            )
-
-            socket_path = result.get(
-                "socketPath"
-            )
-
-            if not socket_path:
-                raise RuntimeError(
-                    "TV did not return pointer socket"
-                )
-
-            kwargs = {
-                "timeout": 6,
-            }
-
-            if socket_path.startswith(
-                "wss://"
-            ):
-                kwargs["sslopt"] = {
-                    "cert_reqs": ssl.CERT_NONE,
-                    "check_hostname": False,
-                }
-
-            pointer = (
-                websocket.create_connection(
-                    socket_path,
-                    **kwargs,
-                )
-            )
-
-            with self.pointer_lock:
-                old = self.pointer_ws
-                self.pointer_ws = pointer
-
-                try:
-                    if old:
-                        old.close()
-                except Exception:
-                    pass
-
-        except Exception:
-            with self.pointer_lock:
-                self.pointer_ws = None
-
-    def ensure_pointer_async(self):
-        with self.pointer_lock:
-            if self.pointer_ws:
-                return
-
-        threading.Thread(
-            target=self._setup_pointer,
-            daemon=True,
-            name="lg-pointer-connect",
-        ).start()
-
-    def pointer_send(self, message):
-        """
-        Pointer traffic is tiny and uses a different socket.
-
-        We keep the critical section short. If the pointer socket has
-        disappeared, reconnect is scheduled in the background.
-        """
-
-        with self.pointer_lock:
-            pointer = self.pointer_ws
-
-            if not pointer:
-                self.ensure_pointer_async()
-                return False
-
-            try:
-                pointer.send(message)
-                return True
-
             except Exception:
                 try:
-                    pointer.close()
-                except Exception:
+                    self.listeners.remove(widget)
+                except ValueError:
                     pass
 
-                self.pointer_ws = None
 
-        self.ensure_pointer_async()
-        return False
-
-    def button(self, name):
-        self.pointer_send(
-            "type:button\n"
-            f"name:{name}\n"
-            "\n"
-        )
-
-    def pointer_move(
-        self,
-        dx,
-        dy,
-    ):
-        dx = int(
-            clamp(
-                dx,
-                -300,
-                300,
-            )
-        )
-
-        dy = int(
-            clamp(
-                dy,
-                -300,
-                300,
-            )
-        )
-
-        if dx == 0 and dy == 0:
-            return
-
-        self.pointer_send(
-            "type:move\n"
-            f"dx:{dx}\n"
-            f"dy:{dy}\n"
-            "down:0\n"
-            "\n"
-        )
-
-    def click(self):
-        self.pointer_send(
-            "type:click\n\n"
-        )
-
-    def volume_up(self):
-        self.request_async(
-            "ssap://audio/volumeUp"
-        )
-
-    def volume_down(self):
-        self.request_async(
-            "ssap://audio/volumeDown"
-        )
-
-    def toggle_mute(self):
-        def got_status(payload):
-            muted = bool(
-                payload.get("mute", False)
-            )
-
-            self.request_async(
-                "ssap://audio/setMute",
-                {
-                    "mute": not muted
-                },
-            )
-
-        self.request_async(
-            "ssap://audio/getStatus",
-            success=got_status,
-        )
-
-    def power_off(
-        self,
-        success=None,
-        failure=None,
-    ):
-        self.request_async(
-            "ssap://system/turnOff",
-            success=success,
-            failure=failure,
-        )
-
-    def disconnect(
-        self,
-        emit=True,
-    ):
-        with self.pointer_lock:
-            pointer = self.pointer_ws
-            self.pointer_ws = None
-
-        try:
-            if pointer:
-                pointer.close()
-        except Exception:
-            pass
-
-        with self.request_lock:
-            control = self.ws
-
-            self.ws = None
-            self.connected = False
-
-        try:
-            if control:
-                control.close()
-        except Exception:
-            pass
-
-        if emit:
-            self._emit(
-                "disconnected",
-                "Disconnected",
-            )
-
-
-# ============================================================
-# Touchpad
-# ============================================================
-
-class TouchPad(Surface):
-    def __init__(self, **kwargs):
-        super().__init__(
-            surface="elevated",
-            radius=28,
-            orientation="vertical",
-            **kwargs,
-        )
-
-        self._touching = False
-        self._last_position = None
-        self._start_position = None
-        self._start_time = 0
-
-        self.label = AppLabel(
-            text="TOUCHPAD",
-            color=Theme.get("muted"),
-            font_size=sp(11),
-            halign="center",
-        )
-
-        self.hint = AppLabel(
-            text="Move your finger to control",
-            color=Theme.get("secondary"),
-            font_size=sp(13),
-            halign="center",
-        )
-
-        self.add_widget(
-            Widget()
-        )
-
-        self.add_widget(
-            self.label
-        )
-
-        self.add_widget(
-            self.hint
-        )
-
-        self.add_widget(
-            Widget()
-        )
-
-    def on_touch_down(
-        self,
-        touch,
-    ):
-        if not self.collide_point(
-            *touch.pos
-        ):
-            return super().on_touch_down(
-                touch
-            )
-
-        touch.grab(self)
-
-        self._touching = True
-        self._last_position = touch.pos
-        self._start_position = touch.pos
-        self._start_time = time.monotonic()
-
-        self._border_color.rgba = Theme.get(
-            "accent",
-            0.58,
-        )
-
-        return True
-
-    def on_touch_move(
-        self,
-        touch,
-    ):
-        if touch.grab_current is not self:
-            return super().on_touch_move(
-                touch
-            )
-
-        if self._last_position:
-            dx = (
-                touch.x
-                - self._last_position[0]
-            ) * 1.35
-
-            dy = (
-                touch.y
-                - self._last_position[1]
-            ) * 1.35
-
-            App.get_running_app().lg.pointer_move(
-                dx,
-                dy,
-            )
-
-        self._last_position = touch.pos
-
-        return True
-
-    def on_touch_up(
-        self,
-        touch,
-    ):
-        if touch.grab_current is not self:
-            return super().on_touch_up(
-                touch
-            )
-
-        touch.ungrab(self)
-
-        self._touching = False
-
-        self._border_color.rgba = Theme.get(
-            "border"
-        )
-
-        if self._start_position:
-            distance = math.hypot(
-                touch.x
-                - self._start_position[0],
-                touch.y
-                - self._start_position[1],
-            )
-
-            duration = (
-                time.monotonic()
-                - self._start_time
-            )
-
-            if (
-                distance < dp(12)
-                and duration < 0.45
-            ):
-                App.get_running_app().lg.click()
-
-        self._last_position = None
-        self._start_position = None
-
-        return True
-
-
-# ============================================================
-# Repeat D-pad button
-# ============================================================
-
-class RepeatButton(PremiumButton):
-    command = StringProperty("")
-
-    def __init__(self, **kwargs):
-        # RepeatButton sends commands itself.
-        kwargs["callback"] = None
-
-        super().__init__(**kwargs)
-
-        self._delay_event = None
-        self._repeat_event = None
-
-    def _send_command(self):
-        if self.command:
-            App.get_running_app().lg.button(
-                self.command
-            )
-
-    def on_touch_down(
-        self,
-        touch,
-    ):
-        handled = super().on_touch_down(
-            touch
-        )
-
-        if (
-            handled
-            and self._pressed
-        ):
-            # First command immediately.
-            self._send_command()
-
-            self._delay_event = (
-                Clock.schedule_once(
-                    self._start_repeat,
-                    0.38,
-                )
-            )
-
-        return handled
-
-    def _start_repeat(
-        self,
-        dt,
-    ):
-        self._delay_event = None
-
-        if not self._pressed:
-            return
-
-        self._repeat_event = (
-            Clock.schedule_interval(
-                self._repeat_tick,
-                0.12,
-            )
-        )
-
-    def _repeat_tick(
-        self,
-        dt,
-    ):
-        if not self._pressed:
-            self._stop_repeat()
-            return False
-
-        self._send_command()
-
-        return True
-
-    def _stop_repeat(self):
-        if self._delay_event:
-            self._delay_event.cancel()
-            self._delay_event = None
-
-        if self._repeat_event:
-            self._repeat_event.cancel()
-            self._repeat_event = None
-
-    def on_touch_up(
-        self,
-        touch,
-    ):
-        if touch.grab_current is self:
-            self._stop_repeat()
-
-        return super().on_touch_up(
-            touch
-        )
-
-
-# ============================================================
-# D-pad
-# ============================================================
-
-class DPad(FloatLayout):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
-        size = (
-            dp(66),
-            dp(54),
-        )
-
-        self.btn_up = RepeatButton(
-            text="UP",
-            command="UP",
-            size_hint=(None, None),
-            size=size,
-            pos_hint={
-                "center_x": 0.5,
-                "top": 1,
-            },
-        )
-
-        self.btn_down = RepeatButton(
-            text="DOWN",
-            command="DOWN",
-            size_hint=(None, None),
-            size=size,
-            pos_hint={
-                "center_x": 0.5,
-                "y": 0,
-            },
-        )
-
-        self.btn_left = RepeatButton(
-            text="LEFT",
-            command="LEFT",
-            size_hint=(None, None),
-            size=size,
-            pos_hint={
-                "x": 0,
-                "center_y": 0.5,
-            },
-        )
-
-        self.btn_right = RepeatButton(
-            text="RIGHT",
-            command="RIGHT",
-            size_hint=(None, None),
-            size=size,
-            pos_hint={
-                "right": 1,
-                "center_y": 0.5,
-            },
-        )
-
-        self.btn_ok = PremiumButton(
-            text="OK",
-            accent="elevated",
-            size_hint=(None, None),
-            size=(
-                dp(68),
-                dp(68),
-            ),
-            pos_hint={
-                "center_x": 0.5,
-                "center_y": 0.5,
-            },
-            callback=lambda button:
-                App.get_running_app().lg.button(
-                    "ENTER"
-                ),
-        )
-
-        for button in (
-            self.btn_up,
-            self.btn_down,
-            self.btn_left,
-            self.btn_right,
-            self.btn_ok,
-        ):
-            self.add_widget(button)
-
-
-# ============================================================
-# Bottom navigation
-# ============================================================
-
-class BottomNavigation(Surface):
-    def __init__(
-        self,
-        active="home",
-        **kwargs,
-    ):
-        super().__init__(
-            surface="surface",
-            radius=23,
-            orientation="horizontal",
-            spacing=dp(4),
-            padding=dp(5),
-            **kwargs,
-        )
-
-        self.size_hint_y = None
-        self.height = dp(67)
-
-        self.active = active
-        self.items = {}
-
-        definitions = [
-            (
-                "home",
-                "HOME",
-                "home",
-            ),
-            (
-                "remote",
-                "REMOTE",
-                "remote",
-            ),
-            (
-                "settings",
-                "SETTINGS",
-                "settings",
-            ),
-        ]
-
-        for screen_name, title, icon_kind in definitions:
-            holder = FloatLayout()
-
-            button = PremiumButton(
-                text=title,
-                accent=(
-                    "elevated"
-                    if screen_name == active
-                    else "surface"
-                ),
-                callback=lambda button, name=screen_name:
-                    self.navigate(name),
-                pos_hint={
-                    "x": 0,
-                    "y": 0,
-                },
-                size_hint=(
-                    1,
-                    1,
-                ),
-            )
-
-            holder.add_widget(
-                button
-            )
-
-            self.add_widget(
-                holder
-            )
-
-            self.items[
-                screen_name
-            ] = button
-
-    def navigate(
-        self,
-        screen_name,
-    ):
+class ThemedWidget:
+    def register_theme(self):
         app = App.get_running_app()
+        if app and getattr(app, "theme", None):
+            app.theme.bind(self)
+            self.apply_theme(app.theme.palette, animated=False)
 
-        if (
-            screen_name == "remote"
-            and not app.lg.connected
-        ):
-            app.toast(
-                "Connect to your TV first."
-            )
-            return
-
-        app.navigate(
-            screen_name
-        )
+    def apply_theme(self, palette, animated=False):
+        pass
 
 
-# ============================================================
-# Screens
-# ============================================================
+class Surface(BoxLayout, ThemedWidget):
+    bg_color = ColorProperty([0.055, 0.067, 0.09, 1])
+    border_color = ColorProperty([0.145, 0.169, 0.208, 1])
+    radius = NumericProperty(dp(18))
 
-class BaseScreen(Screen):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-
         with self.canvas.before:
-            self._background_color = Color(
-                *Theme.get("background")
-            )
-
-            self._background = Rectangle(
+            self._bg_instruction = Color(rgba=self.bg_color)
+            self._bg_rect = RoundedRectangle(
                 pos=self.pos,
                 size=self.size,
+                radius=[self.radius],
+            )
+            self._border_instruction = Color(
+                rgba=self.border_color
+            )
+            self._border_line = Line(
+                rounded_rectangle=(
+                    self.x,
+                    self.y,
+                    self.width,
+                    self.height,
+                    self.radius,
+                ),
+                width=1,
             )
 
         self.bind(
-            pos=self._sync_background,
-            size=self._sync_background,
+            pos=self._update_canvas,
+            size=self._update_canvas,
+            radius=self._update_canvas,
+            bg_color=self._update_colors,
+            border_color=self._update_colors,
         )
-
-    def _sync_background(
-        self,
-        *_,
-    ):
-        self._background.pos = self.pos
-        self._background.size = self.size
-
-
-class SplashScreen(BaseScreen):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
-        root = FloatLayout()
-        self.add_widget(root)
-
-        self.logo = Widget(
-            size_hint=(None, None),
-            size=(
-                dp(112),
-                dp(112),
-            ),
-            pos_hint={
-                "center_x": 0.5,
-                "center_y": 0.58,
-            },
-            opacity=0,
-        )
-
-        with self.logo.canvas:
-            self._logo_glow_color = Color(
-                *Theme.get(
-                    "accent",
-                    0.08,
-                )
-            )
-
-            self._logo_glow = Ellipse()
-
-            self._logo_surface_color = Color(
-                *Theme.get("elevated")
-            )
-
-            self._logo_surface = Ellipse()
-
-            self._logo_ring_color = Color(
-                *Theme.get(
-                    "accent",
-                    0.65,
-                )
-            )
-
-            self._logo_ring = Line(
-                width=dp(2),
-            )
-
-            self._power_line = Line(
-                width=dp(3),
-                cap="round",
-            )
-
-        self.logo.bind(
-            pos=self._sync_logo,
-            size=self._sync_logo,
-        )
-
-        root.add_widget(
-            self.logo
-        )
-
-        self.title = AppLabel(
-            text="FAHD",
-            font_size=sp(24),
-            bold=True,
-            halign="center",
-            size_hint=(
-                0.8,
-                None,
-            ),
-            height=dp(42),
-            pos_hint={
-                "center_x": 0.5,
-                "center_y": 0.41,
-            },
-            opacity=0,
-        )
-
-        root.add_widget(
-            self.title
-        )
-
-        self.subtitle = AppLabel(
-            text="Preparing your remote...",
-            color=Theme.get("muted"),
-            font_size=sp(12),
-            halign="center",
-            size_hint=(
-                0.8,
-                None,
-            ),
-            height=dp(30),
-            pos_hint={
-                "center_x": 0.5,
-                "center_y": 0.36,
-            },
-            opacity=0,
-        )
-
-        root.add_widget(
-            self.subtitle
-        )
-
-    def _sync_logo(self, *_):
-        x = self.logo.x
-        y = self.logo.y
-        w = self.logo.width
-        h = self.logo.height
-
-        self._logo_glow.pos = (
-            x - dp(9),
-            y - dp(9),
-        )
-
-        self._logo_glow.size = (
-            w + dp(18),
-            h + dp(18),
-        )
-
-        self._logo_surface.pos = (
-            x + dp(10),
-            y + dp(10),
-        )
-
-        self._logo_surface.size = (
-            w - dp(20),
-            h - dp(20),
-        )
-
-        self._logo_ring.circle = (
-            x + w / 2,
-            y + h / 2,
-            w * 0.31,
-            -45,
-            225,
-        )
-
-        self._power_line.points = [
-            x + w / 2,
-            y + h * 0.52,
-            x + w / 2,
-            y + h * 0.72,
-        ]
-
-    def begin(self):
-        self.logo.opacity = 0
-        self.title.opacity = 0
-        self.subtitle.opacity = 0
-
-        Animation(
-            opacity=1,
-            duration=0.38,
-            t="out_quad",
-        ).start(
-            self.logo
-        )
-
         Clock.schedule_once(
-            lambda dt:
-                Animation(
-                    opacity=1,
-                    duration=0.30,
-                    t="out_quad",
-                ).start(
-                    self.title
-                ),
-            0.18,
-        )
-
-        Clock.schedule_once(
-            lambda dt:
-                Animation(
-                    opacity=1,
-                    duration=0.28,
-                    t="out_quad",
-                ).start(
-                    self.subtitle
-                ),
-            0.30,
-        )
-
-        Clock.schedule_once(
-            self.finish,
-            1.20,
-        )
-
-    def finish(
-        self,
-        dt,
-    ):
-        app = App.get_running_app()
-
-        if app.settings_store.get(
-            "user_name",
-            "",
-        ).strip():
-            app.navigate("home")
-        else:
-            app.navigate("welcome")
-
-
-class WelcomeScreen(BaseScreen):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
-        root = BoxLayout(
-            orientation="vertical",
-            padding=[
-                dp(24),
-                dp(50),
-                dp(24),
-                dp(34),
-            ],
-            spacing=dp(12),
-        )
-
-        self.add_widget(root)
-
-        root.add_widget(
-            Widget(
-                size_hint_y=0.65
-            )
-        )
-
-        eyebrow = AppLabel(
-            text="FAHD REMOTE",
-            color=Theme.get("accent"),
-            font_size=sp(11),
-            bold=True,
-            size_hint_y=None,
-            height=dp(26),
-        )
-
-        root.add_widget(
-            eyebrow
-        )
-
-        self.heading = AppLabel(
-            text="Welcome",
-            font_size=sp(31),
-            bold=True,
-            size_hint_y=None,
-            height=dp(52),
-        )
-
-        root.add_widget(
-            self.heading
-        )
-
-        self.copy = AppLabel(
-            text="A calm, fast remote for your LG webOS TV.",
-            color=Theme.get("secondary"),
-            font_size=sp(14),
-            size_hint_y=None,
-            height=dp(52),
-        )
-
-        root.add_widget(
-            self.copy
-        )
-
-        root.add_widget(
-            Widget(
-                size_hint_y=None,
-                height=dp(10),
-            )
-        )
-
-        self.name_input = PremiumInput(
-            hint_text="Your name",
-        )
-
-        root.add_widget(
-            self.name_input
-        )
-
-        self.continue_button = PremiumButton(
-            text="CONTINUE",
-            accent="accent",
-            text_color_name="background",
-            size_hint_y=None,
-            height=dp(55),
-            callback=self.continue_pressed,
-        )
-
-        root.add_widget(
-            self.continue_button
-        )
-
-        root.add_widget(
-            Widget(
-                size_hint_y=1
-            )
-        )
-
-    def on_pre_enter(self, *_):
-        widgets = [
-            self.heading,
-            self.copy,
-            self.name_input,
-            self.continue_button,
-        ]
-
-        for widget in widgets:
-            widget.opacity = 0
-
-        for index, widget in enumerate(
-            widgets
-        ):
-            Clock.schedule_once(
-                lambda dt, w=widget:
-                    Animation(
-                        opacity=1,
-                        duration=0.26,
-                        t="out_quad",
-                    ).start(w),
-                0.06 * index,
-            )
-
-        Clock.schedule_once(
-            self._focus_name_input,
-            0.35,
-        )
-
-    def _focus_name_input(self, dt=0):
-        if self.name_input:
-            self.name_input.focus = True
-
-    def continue_pressed(
-        self,
-        *_,
-    ):
-        name = self.name_input.text.strip()
-
-        if not name:
-            App.get_running_app().toast(
-                "Enter your name to continue."
-            )
-            return
-
-        app = App.get_running_app()
-
-        app.settings_store.set(
-            "user_name",
-            name,
-        )
-
-        app.home.refresh_user()
-
-        app.navigate(
-            "home"
-        )
-
-
-class TVConnectionCard(Surface):
-    def __init__(self, **kwargs):
-        super().__init__(
-            surface="surface",
-            radius=24,
-            orientation="vertical",
-            padding=dp(17),
-            spacing=dp(10),
-            **kwargs,
-        )
-
-        self.size_hint_y = None
-        self.height = dp(174)
-
-        top = BoxLayout(
-            spacing=dp(10),
-            size_hint_y=None,
-            height=dp(58),
-        )
-
-        self.indicator = StatusIndicator(
-            size_hint=(None, None),
-            size=(
-                dp(48),
-                dp(48),
-            ),
-        )
-
-        top.add_widget(
-            self.indicator
-        )
-
-        labels = BoxLayout(
-            orientation="vertical"
-        )
-
-        self.name_label = AppLabel(
-            text="LG webOS TV",
-            font_size=sp(17),
-            bold=True,
-        )
-
-        labels.add_widget(
-            self.name_label
-        )
-
-        self.status_label = AppLabel(
-            text="Disconnected",
-            color=Theme.get("muted"),
-            font_size=sp(12),
-        )
-
-        labels.add_widget(
-            self.status_label
-        )
-
-        top.add_widget(
-            labels
-        )
-
-        self.add_widget(
-            top
-        )
-
-        self.search_button = PremiumButton(
-            text="SEARCH FOR TV",
-            accent="elevated",
-            size_hint_y=None,
-            height=dp(52),
-            callback=lambda button:
-                App.get_running_app().start_discovery(),
-        )
-
-        self.add_widget(
-            self.search_button
-        )
-
-    def update(
-        self,
-        state,
-        message="",
-    ):
-        self.indicator.state = state
-
-        if state == "connected":
-            app = App.get_running_app()
-
-            self.name_label.text = (
-                app.lg.tv_name
-                or "LG webOS TV"
-            )
-
-            self.status_label.text = "Connected"
-            self.status_label.color = Theme.get(
-                "green"
-            )
-
-            self.search_button.text = "CHANGE TV"
-
-        elif state == "connecting":
-            self.status_label.text = (
-                "Connecting..."
-            )
-
-            self.status_label.color = Theme.get(
-                "secondary"
-            )
-
-        elif state == "searching":
-            self.status_label.text = (
-                "Searching..."
-            )
-
-            self.status_label.color = Theme.get(
-                "accent"
-            )
-
-        elif state == "error":
-            self.status_label.text = (
-                "Connection failed"
-            )
-
-            self.status_label.color = Theme.get(
-                "red"
-            )
-
-        else:
-            self.status_label.text = (
-                "Disconnected"
-            )
-
-            self.status_label.color = Theme.get(
-                "muted"
-            )
-
-            self.search_button.text = (
-                "SEARCH FOR TV"
-            )
-
-
-class HomeScreen(BaseScreen):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
-        root = BoxLayout(
-            orientation="vertical",
-            padding=[
-                dp(17),
-                dp(22),
-                dp(17),
-                dp(14),
-            ],
-            spacing=dp(13),
-        )
-
-        self.add_widget(root)
-
-        self.brand = AppLabel(
-            text="FAHD / LG",
-            color=Theme.get("muted"),
-            font_size=sp(10),
-            bold=True,
-            size_hint_y=None,
-            height=dp(24),
-        )
-
-        root.add_widget(
-            self.brand
-        )
-
-        self.greeting = AppLabel(
-            text="Hello",
-            font_size=sp(26),
-            bold=True,
-            size_hint_y=None,
-            height=dp(48),
-        )
-
-        root.add_widget(
-            self.greeting
-        )
-
-        self.tv_card = TVConnectionCard()
-
-        root.add_widget(
-            self.tv_card
-        )
-
-        quick = Surface(
-            surface="surface",
-            radius=24,
-            orientation="vertical",
-            padding=dp(16),
-            spacing=dp(9),
-            size_hint_y=None,
-            height=dp(172),
-        )
-
-        quick.add_widget(
-            AppLabel(
-                text="QUICK ACCESS",
-                color=Theme.get("muted"),
-                font_size=sp(10),
-                bold=True,
-                size_hint_y=None,
-                height=dp(25),
-            )
-        )
-
-        buttons = BoxLayout(
-            spacing=dp(9),
-        )
-
-        buttons.add_widget(
-            PremiumButton(
-                text="REMOTE",
-                accent="elevated",
-                callback=lambda button:
-                    self.open_remote(),
-            )
-        )
-
-        buttons.add_widget(
-            PremiumButton(
-                text="SETTINGS",
-                callback=lambda button:
-                    App.get_running_app().navigate(
-                        "settings"
-                    ),
-            )
-        )
-
-        quick.add_widget(
-            buttons
-        )
-
-        root.add_widget(
-            quick
-        )
-
-        root.add_widget(
-            Widget()
-        )
-
-        self.nav = BottomNavigation(
-            active="home"
-        )
-
-        root.add_widget(
-            self.nav
-        )
-
-    def refresh_user(self):
-        app = App.get_running_app()
-
-        name = app.settings_store.get(
-            "user_name",
-            "",
-        ).strip()
-
-        self.greeting.text = (
-            f"Hello, {name}"
-            if name
-            else "Hello"
-        )
-
-    def open_remote(self):
-        app = App.get_running_app()
-
-        if not app.lg.connected:
-            app.toast(
-                "Connect to your TV first."
-            )
-            return
-
-        app.navigate(
-            "remote"
-        )
-
-    def on_pre_enter(self, *_):
-        self.refresh_user()
-
-        widgets = [
-            self.brand,
-            self.greeting,
-            self.tv_card,
-            self.nav,
-        ]
-
-        for widget in widgets:
-            widget.opacity = 0
-
-        for index, widget in enumerate(
-            widgets
-        ):
-            Clock.schedule_once(
-                lambda dt, w=widget:
-                    Animation(
-                        opacity=1,
-                        duration=0.25,
-                        t="out_quad",
-                    ).start(w),
-                index * 0.055,
-            )
-
-
-class DeviceCard(Surface):
-    def __init__(
-        self,
-        device,
-        **kwargs,
-    ):
-        super().__init__(
-            surface="surface",
-            radius=19,
-            orientation="horizontal",
-            padding=dp(13),
-            spacing=dp(8),
-            size_hint_y=None,
-            height=dp(82),
-            **kwargs,
-        )
-
-        self.device = device
-
-        labels = BoxLayout(
-            orientation="vertical"
-        )
-
-        labels.add_widget(
-            AppLabel(
-                text=device.get(
-                    "name",
-                    "LG webOS TV",
-                ),
-                font_size=sp(14),
-                bold=True,
-            )
-        )
-
-        labels.add_widget(
-            AppLabel(
-                text=device.get(
-                    "host",
-                    "",
-                ),
-                color=Theme.get("muted"),
-                font_size=sp(11),
-            )
-        )
-
-        self.add_widget(
-            labels
-        )
-
-        connect = PremiumButton(
-            text="CONNECT",
-            accent="elevated",
-            size_hint_x=None,
-            width=dp(98),
-            callback=self.connect,
-        )
-
-        self.add_widget(
-            connect
-        )
-
-    def connect(
-        self,
-        *_,
-    ):
-        app = App.get_running_app()
-
-        app.lg.connect_async(
-            self.device["host"],
-            self.device.get("name"),
-        )
-
-        app.navigate(
-            "home"
-        )
-
-
-class DiscoveryScreen(BaseScreen):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
-        root = BoxLayout(
-            orientation="vertical",
-            padding=[
-                dp(17),
-                dp(22),
-                dp(17),
-                dp(20),
-            ],
-            spacing=dp(12),
-        )
-
-        self.add_widget(
-            root
-        )
-
-        header = BoxLayout(
-            size_hint_y=None,
-            height=dp(52),
-            spacing=dp(10),
-        )
-
-        header.add_widget(
-            PremiumButton(
-                text="BACK",
-                size_hint_x=None,
-                width=dp(86),
-                callback=lambda button:
-                    App.get_running_app().navigate(
-                        "home"
-                    ),
-            )
-        )
-
-        header.add_widget(
-            AppLabel(
-                text="TV DEVICES",
-                font_size=sp(20),
-                bold=True,
-            )
-        )
-
-        root.add_widget(
-            header
-        )
-
-        status = Surface(
-            surface="surface",
-            radius=18,
-            orientation="horizontal",
-            size_hint_y=None,
-            height=dp(62),
-            padding=[
-                dp(12),
-                dp(7),
-            ],
-            spacing=dp(8),
-        )
-
-        self.loader = LoadingRing(
-            size_hint=(None, None),
-            size=(
-                dp(44),
-                dp(44),
-            ),
-        )
-
-        status.add_widget(
-            self.loader
-        )
-
-        self.status_label = AppLabel(
-            text="Searching your local network...",
-            color=Theme.get("secondary"),
-            font_size=sp(12),
-        )
-
-        status.add_widget(
-            self.status_label
-        )
-
-        root.add_widget(
-            status
-        )
-
-        scroll = ScrollView(
-            do_scroll_x=False,
-        )
-
-        self.results = BoxLayout(
-            orientation="vertical",
-            spacing=dp(9),
-            size_hint_y=None,
-        )
-
-        self.results.bind(
-            minimum_height=self.results.setter(
-                "height"
-            )
-        )
-
-        scroll.add_widget(
-            self.results
-        )
-
-        root.add_widget(
-            scroll
-        )
-
-        root.add_widget(
-            PremiumButton(
-                text="SEARCH AGAIN",
-                accent="elevated",
-                size_hint_y=None,
-                height=dp(53),
-                callback=lambda button:
-                    App.get_running_app().start_discovery(),
-            )
-        )
-
-    def start_search_ui(self):
-        self.results.clear_widgets()
-
-        self.status_label.text = (
-            "Searching your local network..."
-        )
-
-        self.status_label.color = Theme.get(
-            "secondary"
-        )
-
-        self.loader.opacity = 1
-        self.loader.start()
-
-    def display_results(
-        self,
-        devices,
-    ):
-        self.loader.stop()
-
-        Animation(
-            opacity=0,
-            duration=0.18,
-        ).start(
-            self.loader
-        )
-
-        self.results.clear_widgets()
-
-        if not devices:
-            self.status_label.text = (
-                "No LG webOS TVs found."
-            )
-
-            self.status_label.color = Theme.get(
-                "muted"
-            )
-
-            self.status_label.opacity = 0
-
-            Animation(
-                opacity=1,
-                duration=0.28,
+            lambda _dt: self.register_theme(), 0
+        )
+
+    def _update_canvas(self, *_args):
+        self._bg_rect.pos = self.pos
+        self._bg_rect.size = self.size
+        self._bg_rect.radius = [self.radius]
+        self._border_line.rounded_rectangle = (
+            self.x,
+            self.y,
+            self.width,
+            self.height,
+            self.radius,
+        )
+
+    def _update_colors(self, *_args):
+        self._bg_instruction.rgba = self.bg_color
+        self._border_instruction.rgba = self.border_color
+
+    def apply_theme(self, palette, animated=False):
+        if animated:
+            Animation.cancel_all(self, "bg_color", "border_color")
+            animation = Animation(
+                bg_color=palette["surface"],
+                border_color=palette["border"],
+                duration=Design.NORMAL,
                 t="out_quad",
-            ).start(
-                self.status_label
             )
+            animation.start(self)
+        else:
+            self.bg_color = palette["surface"]
+            self.border_color = palette["border"]
 
-            return
 
-        self.status_label.text = (
-            f"{len(devices)} TV"
-            + (
-                "" if len(devices) == 1
-                else "s"
-            )
-            + " found"
+class AppLabel(Label, ThemedWidget):
+    role = StringProperty("text")
+
+    def __init__(self, **kwargs):
+        kwargs.setdefault("font_size", sp(15))
+        kwargs.setdefault("halign", "left")
+        kwargs.setdefault("valign", "middle")
+        super().__init__(**kwargs)
+        self.bind(size=self._sync_text)
+        Clock.schedule_once(
+            lambda _dt: self.register_theme(), 0
         )
 
-        for index, device in enumerate(
-            devices
-        ):
-            card = DeviceCard(
-                device
-            )
+    def _sync_text(self, *_args):
+        self.text_size = self.size
 
-            card.opacity = 0
+    def apply_theme(self, palette, animated=False):
+        target = palette.get(self.role, palette["text"])
+        if animated:
+            Animation.cancel_all(self, "color")
+            Animation(
+                color=target,
+                duration=Design.NORMAL,
+                t="out_quad",
+            ).start(self)
+        else:
+            self.color = target
 
-            self.results.add_widget(
-                card
-            )
 
-            Clock.schedule_once(
-                lambda dt, widget=card:
-                    Animation(
-                        opacity=1,
-                        duration=0.25,
-                        t="out_quad",
-                    ).start(widget),
-                index * 0.065,
-            )
-class RemoteScreen(BaseScreen):
+class PremiumButton(Button, ThemedWidget):
+    accent = BooleanProperty(False)
+    danger = BooleanProperty(False)
+    selected = BooleanProperty(False)
+    bg_color = ColorProperty([0.106, 0.125, 0.161, 1])
+    border_color = ColorProperty([0.145, 0.169, 0.208, 1])
+    text_color = ColorProperty([0.925, 0.941, 0.961, 1])
+
     def __init__(self, **kwargs):
+        kwargs.setdefault("background_normal", "")
+        kwargs.setdefault("background_down", "")
+        kwargs.setdefault("font_size", sp(13))
+        kwargs.setdefault("bold", True)
+        kwargs.setdefault("size_hint_y", None)
+        kwargs.setdefault("height", dp(52))
         super().__init__(**kwargs)
 
-        root = BoxLayout(
-            orientation="vertical",
-            padding=[
-                dp(15),
-                dp(18),
-                dp(15),
-                dp(12),
-            ],
-            spacing=dp(10),
-        )
+        self.background_color = [0, 0, 0, 0]
+        self.color = self.text_color
 
-        self.add_widget(root)
-
-        header = BoxLayout(
-            size_hint_y=None,
-            height=dp(48),
-            spacing=dp(9),
-        )
-
-        self.heading = AppLabel(
-            text="REMOTE",
-            font_size=sp(21),
-            bold=True,
-        )
-
-        header.add_widget(
-            self.heading
-        )
-
-        self.power_button = PremiumButton(
-            text="POWER",
-            accent="red",
-            size_hint_x=None,
-            width=dp(100),
-            callback=self.power_pressed,
-        )
-
-        header.add_widget(
-            self.power_button
-        )
-
-        root.add_widget(
-            header
-        )
-
-        self.touchpad = TouchPad(
-            size_hint_y=None,
-            height=dp(178),
-        )
-
-        root.add_widget(
-            self.touchpad
-        )
-
-        control_row = BoxLayout(
-            size_hint_y=None,
-            height=dp(188),
-            spacing=dp(10),
-        )
-
-        self.dpad = DPad()
-
-        control_row.add_widget(
-            self.dpad
-        )
-
-        volume = Surface(
-            surface="surface",
-            radius=20,
-            orientation="vertical",
-            size_hint_x=None,
-            width=dp(91),
-            padding=dp(7),
-            spacing=dp(7),
-        )
-
-        volume.add_widget(
-            PremiumButton(
-                text="VOL +",
-                callback=lambda button:
-                    App.get_running_app().lg.volume_up(),
+        with self.canvas.before:
+            self._button_bg_color = Color(rgba=self.bg_color)
+            self._button_bg = RoundedRectangle(
+                pos=self.pos,
+                size=self.size,
+                radius=[Design.SMALL_RADIUS],
             )
-        )
-
-        volume.add_widget(
-            PremiumButton(
-                text="VOL -",
-                callback=lambda button:
-                    App.get_running_app().lg.volume_down(),
+            self._button_border_color = Color(
+                rgba=self.border_color
             )
-        )
-
-        volume.add_widget(
-            PremiumButton(
-                text="MUTE",
-                callback=lambda button:
-                    App.get_running_app().lg.toggle_mute(),
-            )
-        )
-
-        control_row.add_widget(
-            volume
-        )
-
-        root.add_widget(
-            control_row
-        )
-
-        media = BoxLayout(
-            size_hint_y=None,
-            height=dp(52),
-            spacing=dp(7),
-        )
-
-        commands = [
-            (
-                "BACK",
-                "BACK",
-            ),
-            (
-                "HOME",
-                "HOME",
-            ),
-            (
-                "PLAY",
-                "PLAY",
-            ),
-        ]
-
-        for title, command in commands:
-            media.add_widget(
-                PremiumButton(
-                    text=title,
-                    callback=lambda button, c=command:
-                        App.get_running_app().lg.button(
-                            c
-                        ),
-                )
+            self._button_border = Line(
+                rounded_rectangle=(
+                    self.x,
+                    self.y,
+                    self.width,
+                    self.height,
+                    Design.SMALL_RADIUS,
+                ),
+                width=1,
             )
 
-        root.add_widget(
-            media
-        )
-
-        root.add_widget(
-            Widget(
-                size_hint_y=0.2
-            )
-        )
-
-        self.nav = BottomNavigation(
-            active="remote"
-        )
-
-        root.add_widget(
-            self.nav
-        )
-
-    def on_pre_enter(
-        self,
-        *_,
-    ):
-        app = App.get_running_app()
-
-        if not app.lg.connected:
-            Clock.schedule_once(
-                lambda dt:
-                    app.navigate(
-                        "home"
-                    ),
-                0,
-            )
-
-            return
-
-        app.lg.ensure_pointer_async()
-
-        widgets = [
-            self.heading,
-            self.touchpad,
-            self.dpad,
-            self.nav,
-        ]
-
-        for widget in widgets:
-            widget.opacity = 0
-
-        for index, widget in enumerate(
-            widgets
-        ):
-            Clock.schedule_once(
-                lambda dt, w=widget:
-                    Animation(
-                        opacity=1,
-                        duration=0.24,
-                        t="out_quad",
-                    ).start(w),
-                index * 0.055,
-            )
-
-    def power_pressed(
-        self,
-        *_,
-    ):
-        app = App.get_running_app()
-
-        if not app.lg.connected:
-            app.toast(
-                "TV is not connected."
-            )
-            return
-
-        self.power_button.disabled = True
-        self.power_button.text = "SENDING..."
-
-        app.lg.power_off(
-            success=self._power_success,
-            failure=self._power_failure,
-        )
-
-    def _power_success(
-        self,
-        payload,
-    ):
-        self.power_button.disabled = False
-        self.power_button.text = "SENT"
-
-        App.get_running_app().toast(
-            "Power command sent."
+        self.bind(
+            pos=self._canvas_update,
+            size=self._canvas_update,
+            bg_color=self._color_update,
+            border_color=self._color_update,
+            text_color=self._color_update,
         )
 
         Clock.schedule_once(
-            lambda dt:
-                setattr(
-                    self.power_button,
-                    "text",
-                    "POWER",
-                ),
-            1.0,
+            lambda _dt: self.register_theme(), 0
         )
 
-    def _power_failure(
-        self,
-        error,
-    ):
-        self.power_button.disabled = False
-        self.power_button.text = "POWER"
-
-        App.get_running_app().toast(
-            "Could not send the power command."
+    def _canvas_update(self, *_args):
+        self._button_bg.pos = self.pos
+        self._button_bg.size = self.size
+        self._button_border.rounded_rectangle = (
+            self.x,
+            self.y,
+            self.width,
+            self.height,
+            Design.SMALL_RADIUS,
         )
 
+    def _color_update(self, *_args):
+        self._button_bg_color.rgba = self.bg_color
+        self._button_border_color.rgba = self.border_color
+        self.color = self.text_color
 
-class SettingsScreen(BaseScreen):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
-        root = BoxLayout(
-            orientation="vertical",
-            padding=[
-                dp(17),
-                dp(22),
-                dp(17),
-                dp(14),
-            ],
-            spacing=dp(11),
-        )
-
-        self.add_widget(
-            root
-        )
-
-        root.add_widget(
-            AppLabel(
-                text="SETTINGS",
-                font_size=sp(23),
-                bold=True,
-                size_hint_y=None,
-                height=dp(50),
-            )
-        )
-
-        profile = Surface(
-            surface="surface",
-            radius=22,
-            orientation="vertical",
-            padding=dp(15),
-            spacing=dp(8),
-            size_hint_y=None,
-            height=dp(167),
-        )
-
-        profile.add_widget(
-            AppLabel(
-                text="PROFILE",
-                color=Theme.get("muted"),
-                font_size=sp(10),
-                bold=True,
-                size_hint_y=None,
-                height=dp(25),
-            )
-        )
-
-        self.name_input = PremiumInput(
-            hint_text="Your name",
-        )
-
-        profile.add_widget(
-            self.name_input
-        )
-
-        profile.add_widget(
-            PremiumButton(
-                text="SAVE NAME",
-                accent="elevated",
-                size_hint_y=None,
-                height=dp(48),
-                callback=self.save_name,
-            )
-        )
-
-        root.add_widget(
-            profile
-        )
-
-        tv = Surface(
-            surface="surface",
-            radius=22,
-            orientation="vertical",
-            padding=dp(15),
-            spacing=dp(8),
-            size_hint_y=None,
-            height=dp(150),
-        )
-
-        tv.add_widget(
-            AppLabel(
-                text="TELEVISION",
-                color=Theme.get("muted"),
-                font_size=sp(10),
-                bold=True,
-                size_hint_y=None,
-                height=dp(25),
-            )
-        )
-
-        self.tv_status = AppLabel(
-            text="No TV connected",
-            color=Theme.get("secondary"),
-            font_size=sp(13),
-            size_hint_y=None,
-            height=dp(31),
-        )
-
-        tv.add_widget(
-            self.tv_status
-        )
-
-        tv.add_widget(
-            PremiumButton(
-                text="FIND A TV",
-                size_hint_y=None,
-                height=dp(48),
-                callback=lambda button:
-                    App.get_running_app().start_discovery(),
-            )
-        )
-
-        root.add_widget(
-            tv
-        )
-
-        info = Surface(
-            surface="surface",
-            radius=22,
-            orientation="vertical",
-            padding=dp(15),
-            spacing=dp(2),
-            size_hint_y=None,
-            height=dp(102),
-        )
-
-        info.add_widget(
-            AppLabel(
-                text="FAHD REMOTE",
-                font_size=sp(13),
-                bold=True,
-            )
-        )
-
-        info.add_widget(
-            AppLabel(
-                text="LG webOS • Local network control",
-                color=Theme.get("muted"),
-                font_size=sp(11),
-            )
-        )
-
-        root.add_widget(
-            info
-        )
-
-        root.add_widget(
-            Widget()
-        )
-
-        self.nav = BottomNavigation(
-            active="settings"
-        )
-
-        root.add_widget(
-            self.nav
-        )
-
-    def on_pre_enter(
-        self,
-        *_,
-    ):
-        app = App.get_running_app()
-
-        self.name_input.text = (
-            app.settings_store.get(
-                "user_name",
-                "",
-            )
-        )
-
-        if app.lg.connected:
-            self.tv_status.text = (
-                app.lg.tv_name
-                or "LG webOS TV"
-            )
-
-            self.tv_status.color = Theme.get(
-                "green"
-            )
+    def apply_theme(self, palette, animated=False):
+        if self.danger:
+            bg = [
+                palette["red"][0] * 0.42,
+                palette["red"][1] * 0.42,
+                palette["red"][2] * 0.42,
+                1,
+            ]
+            border = palette["red"]
+        elif self.accent or self.selected:
+            bg = [
+                palette["accent"][0] * 0.34,
+                palette["accent"][1] * 0.34,
+                palette["accent"][2] * 0.34,
+                1,
+            ]
+            border = palette["accent"]
         else:
-            self.tv_status.text = (
-                "No TV connected"
+            bg = palette["soft"]
+            border = palette["border"]
+
+        if animated:
+            Animation.cancel_all(
+                self,
+                "bg_color",
+                "border_color",
+                "text_color",
             )
-
-            self.tv_status.color = Theme.get(
-                "secondary"
+            animation = Animation(
+                bg_color=bg,
+                border_color=border,
+                text_color=palette["text"],
+                duration=Design.NORMAL,
+                t="out_quad",
             )
-
-    def save_name(
-        self,
-        *_,
-    ):
-        value = self.name_input.text.strip()
-
-        if not value:
-            App.get_running_app().toast(
-                "Name cannot be empty."
-            )
-            return
-
-        app = App.get_running_app()
-
-        app.settings_store.set(
-            "user_name",
-            value,
-        )
-
-        app.home.refresh_user()
-
-        app.toast(
-            "Name saved."
-        )
-
-
-# ============================================================
-# Toast
-# ============================================================
-
-class ToastLayer(FloatLayout):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
-        self.opacity = 0
-        self.disabled = True
-
-        self.card = Surface(
-            surface="elevated",
-            radius=18,
-            orientation="horizontal",
-            padding=[
-                dp(16),
-                dp(7),
-            ],
-            size_hint=(
-                0.90,
-                None,
-            ),
-            height=dp(56),
-            pos_hint={
-                "center_x": 0.5,
-                "y": 0.035,
-            },
-        )
-
-        self.label = AppLabel(
-            text="",
-            font_size=sp(12),
-            halign="center",
-        )
-
-        self.card.add_widget(
-            self.label
-        )
-
-        self.add_widget(
-            self.card
-        )
-
-        self._hide_event = None
+            animation.start(self)
+        else:
+            self.bg_color = bg
+            self.border_color = border
+            self.text_color = palette["text"]
 
     def on_touch_down(self, touch):
-        # Toast is visual only. Never block controls behind it.
+        handled = super().on_touch_down(touch)
+        if handled and self.collide_point(*touch.pos):
+            app = App.get_running_app()
+            if app and app.theme:
+                palette = app.theme.palette
+                target = palette["elevated"]
+                if self.danger:
+                    target = palette["red"]
+                elif self.accent:
+                    target = [
+                        palette["accent"][0] * 0.55,
+                        palette["accent"][1] * 0.55,
+                        palette["accent"][2] * 0.55,
+                        1,
+                    ]
+                Animation.cancel_all(self, "bg_color")
+                Animation(
+                    bg_color=target,
+                    duration=Design.MICRO,
+                    t="out_quad",
+                ).start(self)
+        return handled
+
+    def on_touch_up(self, touch):
+        handled = super().on_touch_up(touch)
+        app = App.get_running_app()
+        if app and app.theme:
+            self.apply_theme(app.theme.palette, animated=True)
+        return handled
+
+
+class PremiumInput(TextInput, ThemedWidget):
+    field_bg = ColorProperty([0.055, 0.067, 0.09, 1])
+    field_border = ColorProperty([0.145, 0.169, 0.208, 1])
+
+    def __init__(self, **kwargs):
+        kwargs.setdefault("multiline", False)
+        kwargs.setdefault("font_size", sp(16))
+        kwargs.setdefault("padding", [dp(16), dp(14), dp(16), dp(12)])
+        kwargs.setdefault("size_hint_y", None)
+        kwargs.setdefault("height", dp(54))
+        super().__init__(**kwargs)
+
+        self.background_normal = ""
+        self.background_active = ""
+        self.background_color = [0, 0, 0, 0]
+
+        with self.canvas.before:
+            self._field_color = Color(rgba=self.field_bg)
+            self._field_rect = RoundedRectangle(
+                pos=self.pos,
+                size=self.size,
+                radius=[Design.SMALL_RADIUS],
+            )
+            self._field_border_color = Color(
+                rgba=self.field_border
+            )
+            self._field_border_line = Line(
+                rounded_rectangle=(
+                    self.x,
+                    self.y,
+                    self.width,
+                    self.height,
+                    Design.SMALL_RADIUS,
+                ),
+                width=1,
+            )
+
+        self.bind(
+            pos=self._update_field,
+            size=self._update_field,
+            field_bg=self._update_field_colors,
+            field_border=self._update_field_colors,
+            focus=self._focus_changed,
+        )
+        Clock.schedule_once(
+            lambda _dt: self.register_theme(), 0
+        )
+
+    def _update_field(self, *_args):
+        self._field_rect.pos = self.pos
+        self._field_rect.size = self.size
+        self._field_border_line.rounded_rectangle = (
+            self.x,
+            self.y,
+            self.width,
+            self.height,
+            Design.SMALL_RADIUS,
+        )
+
+    def _update_field_colors(self, *_args):
+        self._field_color.rgba = self.field_bg
+        self._field_border_color.rgba = self.field_border
+
+    def _focus_changed(self, *_args):
+        app = App.get_running_app()
+        if not app or not app.theme:
+            return
+        palette = app.theme.palette
+        target = (
+            palette["accent"]
+            if self.focus
+            else palette["border"]
+        )
+        Animation.cancel_all(self, "field_border")
+        Animation(
+            field_border=target,
+            duration=Design.FAST,
+            t="out_quad",
+        ).start(self)
+
+    def apply_theme(self, palette, animated=False):
+        self.foreground_color = palette["text"]
+        self.hint_text_color = palette["muted"]
+        self.cursor_color = palette["accent"]
+        target_border = (
+            palette["accent"]
+            if self.focus
+            else palette["border"]
+        )
+
+        if animated:
+            Animation.cancel_all(
+                self, "field_bg", "field_border"
+            )
+            Animation(
+                field_bg=palette["surface"],
+                field_border=target_border,
+                duration=Design.NORMAL,
+                t="out_quad",
+            ).start(self)
+        else:
+            self.field_bg = palette["surface"]
+            self.field_border = target_border
+
+
+class ConnectionIndicator(Widget, ThemedWidget):
+    state = StringProperty("disconnected")
+    dot_color = ColorProperty([0.45, 0.48, 0.53, 1])
+    pulse_alpha = NumericProperty(0)
+
+    def __init__(self, **kwargs):
+        kwargs.setdefault("size_hint", (None, None))
+        kwargs.setdefault("size", (dp(18), dp(18)))
+        super().__init__(**kwargs)
+
+        with self.canvas:
+            self._pulse_color = Color(1, 1, 1, 0)
+            self._pulse = Ellipse()
+            self._dot_canvas_color = Color(rgba=self.dot_color)
+            self._dot = Ellipse()
+
+        self.bind(
+            pos=self._draw,
+            size=self._draw,
+            dot_color=self._draw,
+            pulse_alpha=self._draw,
+            state=self._state_changed,
+        )
+
+        Clock.schedule_once(
+            lambda _dt: self.register_theme(), 0
+        )
+
+    def _draw(self, *_args):
+        outer = min(self.width, self.height)
+        inner = dp(8)
+
+        self._pulse.pos = (
+            self.center_x - outer / 2,
+            self.center_y - outer / 2,
+        )
+        self._pulse.size = (outer, outer)
+
+        self._dot.pos = (
+            self.center_x - inner / 2,
+            self.center_y - inner / 2,
+        )
+        self._dot.size = (inner, inner)
+
+        self._dot_canvas_color.rgba = self.dot_color
+        self._pulse_color.rgba = [
+            self.dot_color[0],
+            self.dot_color[1],
+            self.dot_color[2],
+            self.pulse_alpha,
+        ]
+
+    def _state_changed(self, *_args):
+        Animation.cancel_all(self)
+        app = App.get_running_app()
+        if app and app.theme:
+            self.apply_theme(app.theme.palette, animated=True)
+
+    def apply_theme(self, palette, animated=False):
+        state_colors = {
+            "disconnected": palette["muted"],
+            "searching": palette["accent"],
+            "connecting": palette["accent"],
+            "connected": palette["green"],
+            "error": palette["red"],
+        }
+        target = state_colors.get(
+            self.state, palette["muted"]
+        )
+
+        if animated:
+            Animation(
+                dot_color=target,
+                duration=Design.FAST,
+                t="out_quad",
+            ).start(self)
+        else:
+            self.dot_color = target
+
+        if self.state in ("searching", "connecting"):
+            sequence = (
+                Animation(
+                    pulse_alpha=0.22,
+                    duration=0.55,
+                    t="in_out_quad",
+                )
+                + Animation(
+                    pulse_alpha=0.02,
+                    duration=0.55,
+                    t="in_out_quad",
+                )
+            )
+            sequence.repeat = True
+            sequence.start(self)
+        elif self.state == "connected":
+            sequence = (
+                Animation(
+                    pulse_alpha=0.18,
+                    duration=0.22,
+                    t="out_quad",
+                )
+                + Animation(
+                    pulse_alpha=0.05,
+                    duration=0.3,
+                    t="out_quad",
+                )
+            )
+            sequence.start(self)
+        else:
+            self.pulse_alpha = 0
+
+
+class LoadingIndicator(Widget, ThemedWidget):
+    active = BooleanProperty(False)
+    angle = NumericProperty(0)
+    indicator_color = ColorProperty([0.557, 0.655, 0.78, 1])
+
+    def __init__(self, **kwargs):
+        kwargs.setdefault("size_hint", (None, None))
+        kwargs.setdefault("size", (dp(28), dp(28)))
+        super().__init__(**kwargs)
+
+        with self.canvas:
+            self._loading_color = Color(
+                rgba=self.indicator_color
+            )
+            self._loading_line = Line(width=dp(2))
+
+        self.bind(
+            pos=self._redraw,
+            size=self._redraw,
+            angle=self._redraw,
+            indicator_color=self._redraw,
+            active=self._active_changed,
+        )
+
+        Clock.schedule_once(
+            lambda _dt: self.register_theme(), 0
+        )
+
+    def _redraw(self, *_args):
+        self._loading_color.rgba = self.indicator_color
+        radius = max(1, min(self.width, self.height) / 2 - dp(3))
+        self._loading_line.circle = (
+            self.center_x,
+            self.center_y,
+            radius,
+            self.angle,
+            self.angle + 260,
+        )
+
+    def _active_changed(self, *_args):
+        Animation.cancel_all(self, "angle")
+        if self.active:
+            self.angle = 0
+            animation = Animation(
+                angle=360,
+                duration=0.85,
+                t="linear",
+            )
+            animation.repeat = True
+            animation.start(self)
+        else:
+            self.angle = 0
+
+    def apply_theme(self, palette, animated=False):
+        self.indicator_color = palette["accent"]
+
+
+class Toast(FloatLayout):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.label = None
+        self._dismiss_event = None
+
+    def show(self, text, error=False):
+        if self._dismiss_event:
+            self._dismiss_event.cancel()
+            self._dismiss_event = None
+
+        if self.label:
+            self.remove_widget(self.label)
+
+        app = App.get_running_app()
+        palette = app.theme.palette
+
+        label = Label(
+            text=text,
+            color=palette["text"],
+            font_size=sp(13),
+            size_hint=(0.88, None),
+            height=dp(46),
+            pos_hint={"center_x": 0.5},
+            y=dp(20),
+            opacity=0,
+        )
+
+        with label.canvas.before:
+            color_instruction = Color(
+                rgba=(
+                    palette["red"]
+                    if error
+                    else palette["elevated"]
+                )
+            )
+            rect = RoundedRectangle(
+                pos=label.pos,
+                size=label.size,
+                radius=[dp(13)],
+            )
+
+        def update(*_args):
+            color_instruction.rgba = (
+                palette["red"]
+                if error
+                else palette["elevated"]
+            )
+            rect.pos = label.pos
+            rect.size = label.size
+
+        label.bind(pos=update, size=update)
+        self.label = label
+        self.add_widget(label)
+
+        animation = (
+            Animation(
+                opacity=1,
+                duration=Design.FAST,
+                t="out_quad",
+            )
+            + Animation(duration=1.8)
+            + Animation(
+                opacity=0,
+                duration=Design.FAST,
+                t="out_quad",
+            )
+        )
+        animation.bind(
+            on_complete=lambda *_args: self._remove_label(label)
+        )
+        animation.start(label)
+
+    def _remove_label(self, label):
+        if self.label is label:
+            try:
+                self.remove_widget(label)
+            except Exception:
+                pass
+            self.label = None
+
+    def on_touch_down(self, touch):
         return False
 
     def on_touch_move(self, touch):
@@ -3675,287 +1316,1632 @@ class ToastLayer(FloatLayout):
     def on_touch_up(self, touch):
         return False
 
-    def show(
-        self,
-        message,
-    ):
-        if self._hide_event:
-            self._hide_event.cancel()
 
-        self.label.text = str(
-            message
-        )
+class AppScreen(Screen, ThemedWidget):
+    bg_color = ColorProperty([0.027, 0.035, 0.051, 1])
 
-        Animation.cancel_all(
-            self
-        )
-
-        self.opacity = 0
-
-        Animation(
-            opacity=1,
-            duration=0.16,
-            t="out_quad",
-        ).start(self)
-
-        self._hide_event = (
-            Clock.schedule_once(
-                self.hide,
-                2.35,
-            )
-        )
-
-    def hide(
-        self,
-        dt,
-    ):
-        self._hide_event = None
-
-        Animation(
-            opacity=0,
-            duration=0.22,
-            t="out_quad",
-        ).start(self)
-
-
-# ============================================================
-# Root
-# ============================================================
-
-class RootWidget(FloatLayout):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
-        self.manager = ScreenManager(
-            transition=SlideTransition(
-                duration=0.20,
-            )
-        )
-
-        self.add_widget(
-            self.manager
-        )
-
-        self.toast_layer = ToastLayer()
-
-        self.add_widget(
-            self.toast_layer
-        )
-
-
-# ============================================================
-# Application
-# ============================================================
-
-class AetherRemoteApp(App):
-    def build(self):
-        self.title = "Fahd LG Remote"
-
-        self.settings_store = SettingsStore()
-
-        self.lg = LGWebOSClient(
-            settings=self.settings_store,
-            state_callback=self.on_tv_state,
-        )
-
-        root = RootWidget()
-
-        self.root_widget = root
-
-        manager = root.manager
-
-        self.splash = SplashScreen(
-            name="splash"
-        )
-
-        self.welcome = WelcomeScreen(
-            name="welcome"
-        )
-
-        self.home = HomeScreen(
-            name="home"
-        )
-
-        self.discovery = DiscoveryScreen(
-            name="discovery"
-        )
-
-        self.remote = RemoteScreen(
-            name="remote"
-        )
-
-        self.settings_screen = SettingsScreen(
-            name="settings"
-        )
-
-        for screen in (
-            self.splash,
-            self.welcome,
-            self.home,
-            self.discovery,
-            self.remote,
-            self.settings_screen,
-        ):
-            manager.add_widget(
-                screen
+        with self.canvas.before:
+            self._screen_color = Color(rgba=self.bg_color)
+            self._screen_rect = RoundedRectangle(
+                pos=self.pos,
+                size=self.size,
+                radius=[0],
             )
 
-        manager.current = "splash"
+        self.bind(
+            pos=self._screen_canvas,
+            size=self._screen_canvas,
+            bg_color=self._screen_canvas,
+        )
 
         Clock.schedule_once(
-            lambda dt:
-                self.splash.begin(),
+            lambda _dt: self.register_theme(), 0
+        )
+
+    def _screen_canvas(self, *_args):
+        self._screen_color.rgba = self.bg_color
+        self._screen_rect.pos = self.pos
+        self._screen_rect.size = self.size
+
+    def apply_theme(self, palette, animated=False):
+        if animated:
+            Animation.cancel_all(self, "bg_color")
+            Animation(
+                bg_color=palette["background"],
+                duration=Design.NORMAL,
+                t="out_quad",
+            ).start(self)
+        else:
+            self.bg_color = palette["background"]
+
+
+class SplashScreen(AppScreen):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+        root = AnchorLayout()
+        content = BoxLayout(
+            orientation="vertical",
+            size_hint=(0.86, None),
+            height=dp(160),
+            spacing=dp(10),
+        )
+
+        self.logo = AppLabel(
+            text="FAHD REMOTE",
+            font_size=sp(30),
+            bold=True,
+            halign="center",
+            opacity=0,
+        )
+        self.subtitle = AppLabel(
+            text="Preparing your remote...",
+            role="secondary",
+            font_size=sp(14),
+            halign="center",
+            opacity=0,
+        )
+
+        content.add_widget(self.logo)
+        content.add_widget(self.subtitle)
+        root.add_widget(content)
+        self.add_widget(root)
+
+    def on_enter(self, *_args):
+        self.logo.opacity = 0
+        self.subtitle.opacity = 0
+
+        first = Animation(
+            opacity=1,
+            duration=0.3,
+            t="out_cubic",
+        )
+        second = Animation(
+            opacity=1,
+            duration=0.25,
+            t="out_quad",
+        )
+
+        first.start(self.logo)
+        Clock.schedule_once(
+            lambda _dt: second.start(self.subtitle),
+            0.18,
+        )
+        Clock.schedule_once(self._finish, 0.9)
+
+    def _finish(self, _dt):
+        app = App.get_running_app()
+        if app.store.get("name", "").strip():
+            app.go("home")
+        else:
+            app.go("welcome")
+
+
+class WelcomeScreen(AppScreen):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+        outer = AnchorLayout(
+            anchor_x="center",
+            anchor_y="center",
+            padding=dp(24),
+        )
+
+        card = Surface(
+            orientation="vertical",
+            size_hint=(1, None),
+            height=dp(350),
+            padding=dp(24),
+            spacing=dp(14),
+        )
+
+        card.add_widget(
+            AppLabel(
+                text="FAHD REMOTE",
+                font_size=sp(13),
+                bold=True,
+                role="accent",
+                size_hint_y=None,
+                height=dp(28),
+            )
+        )
+        card.add_widget(
+            AppLabel(
+                text="Welcome",
+                font_size=sp(30),
+                bold=True,
+                size_hint_y=None,
+                height=dp(56),
+            )
+        )
+        card.add_widget(
+            AppLabel(
+                text="A calm, fast remote for your LG webOS TV.",
+                role="secondary",
+                font_size=sp(15),
+                size_hint_y=None,
+                height=dp(48),
+            )
+        )
+
+        self.name_input = PremiumInput(
+            hint_text="Your name",
+            size_hint_y=None,
+            height=dp(54),
+        )
+        self.name_input.bind(
+            on_text_validate=lambda *_args: self.continue_app()
+        )
+        card.add_widget(self.name_input)
+
+        button = PremiumButton(
+            text="CONTINUE",
+            accent=True,
+        )
+        button.bind(
+            on_release=lambda *_args: self.continue_app()
+        )
+        card.add_widget(button)
+
+        outer.add_widget(card)
+        self.add_widget(outer)
+
+    def on_pre_enter(self, *_args):
+        app = App.get_running_app()
+        self.name_input.text = app.store.get("name", "")
+
+    def continue_app(self):
+        value = self.name_input.text.strip()
+        if not value:
+            App.get_running_app().toast(
+                "Please enter your name.",
+                error=True,
+            )
+            self.name_input.focus = True
+            return
+
+        app = App.get_running_app()
+        app.store.set("name", value)
+        self.name_input.focus = False
+        app.go("home")
+
+
+class NavigationBar(Surface):
+    def __init__(self, active="home", **kwargs):
+        kwargs.setdefault("orientation", "horizontal")
+        kwargs.setdefault("size_hint_y", None)
+        kwargs.setdefault("height", dp(66))
+        kwargs.setdefault("padding", dp(7))
+        kwargs.setdefault("spacing", dp(7))
+        super().__init__(**kwargs)
+
+        for text, screen in (
+            ("HOME", "home"),
+            ("REMOTE", "remote"),
+            ("SETTINGS", "settings"),
+        ):
+            button = PremiumButton(
+                text=text,
+                size_hint_y=1,
+                height=dp(52),
+                selected=(screen == active),
+            )
+            button.bind(
+                on_release=lambda _btn, target=screen:
+                App.get_running_app().go(target)
+            )
+            self.add_widget(button)
+
+
+class HomeScreen(AppScreen):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+        root = BoxLayout(
+            orientation="vertical",
+            padding=[dp(18), dp(20), dp(18), dp(14)],
+            spacing=dp(14),
+        )
+
+        header = BoxLayout(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(92),
+        )
+        header.add_widget(
+            AppLabel(
+                text="FAHD / LG",
+                role="accent",
+                font_size=sp(12),
+                bold=True,
+            )
+        )
+        self.hello = AppLabel(
+            text="Hello",
+            font_size=sp(27),
+            bold=True,
+        )
+        header.add_widget(self.hello)
+        root.add_widget(header)
+
+        connection = Surface(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(190),
+            padding=dp(18),
+            spacing=dp(9),
+        )
+
+        connection.add_widget(
+            AppLabel(
+                text="LG webOS TV",
+                font_size=sp(18),
+                bold=True,
+                size_hint_y=None,
+                height=dp(34),
+            )
+        )
+
+        status_row = BoxLayout(
+            orientation="horizontal",
+            size_hint_y=None,
+            height=dp(32),
+            spacing=dp(7),
+        )
+        self.indicator = ConnectionIndicator()
+        status_row.add_widget(self.indicator)
+
+        self.status_label = AppLabel(
+            text="Disconnected",
+            role="secondary",
+            font_size=sp(14),
+        )
+        status_row.add_widget(self.status_label)
+        connection.add_widget(status_row)
+
+        self.tv_label = AppLabel(
+            text="No TV selected",
+            role="muted",
+            font_size=sp(12),
+            size_hint_y=None,
+            height=dp(28),
+        )
+        connection.add_widget(self.tv_label)
+
+        self.search_button = PremiumButton(
+            text="SEARCH FOR TV",
+            accent=True,
+        )
+        self.search_button.bind(
+            on_release=lambda *_args:
+            App.get_running_app().go("discovery")
+        )
+        connection.add_widget(self.search_button)
+
+        root.add_widget(connection)
+
+        quick_title = AppLabel(
+            text="Quick Access",
+            font_size=sp(15),
+            bold=True,
+            size_hint_y=None,
+            height=dp(34),
+        )
+        root.add_widget(quick_title)
+
+        quick = BoxLayout(
+            orientation="horizontal",
+            size_hint_y=None,
+            height=dp(72),
+            spacing=dp(10),
+        )
+
+        remote = PremiumButton(text="REMOTE")
+        remote.bind(
+            on_release=lambda *_args:
+            App.get_running_app().go("remote")
+        )
+        settings = PremiumButton(text="SETTINGS")
+        settings.bind(
+            on_release=lambda *_args:
+            App.get_running_app().go("settings")
+        )
+
+        quick.add_widget(remote)
+        quick.add_widget(settings)
+        root.add_widget(quick)
+
+        root.add_widget(Widget())
+        root.add_widget(NavigationBar(active="home"))
+        self.add_widget(root)
+
+    def on_pre_enter(self, *_args):
+        app = App.get_running_app()
+        person = app.store.get("name", "").strip()
+        self.hello.text = (
+            "Hello, {}".format(person)
+            if person
+            else "Hello"
+        )
+
+        tv_name = app.store.get("last_tv_name", "")
+        host = app.store.get("last_tv", "")
+        if tv_name or host:
+            self.tv_label.text = tv_name or host
+        else:
+            self.tv_label.text = "No TV selected"
+
+        self.update_connection(
+            app.connection_state,
+            app.connection_message,
+        )
+
+    def update_connection(self, state, message=""):
+        self.indicator.state = state
+
+        labels = {
+            "disconnected": "Disconnected",
+            "searching": "Searching",
+            "connecting": "Connecting",
+            "connected": "Connected",
+            "error": "Connection error",
+        }
+        self.status_label.text = labels.get(
+            state, "Disconnected"
+        )
+
+        self.search_button.text = (
+            "CHANGE TV"
+            if state == "connected"
+            else "SEARCH FOR TV"
+        )
+
+
+class DiscoveryScreen(AppScreen):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.result_hosts = set()
+
+        root = BoxLayout(
+            orientation="vertical",
+            padding=[dp(18), dp(20), dp(18), dp(16)],
+            spacing=dp(12),
+        )
+
+        top = BoxLayout(
+            orientation="horizontal",
+            size_hint_y=None,
+            height=dp(54),
+            spacing=dp(8),
+        )
+
+        back = PremiumButton(
+            text="BACK",
+            size_hint_x=None,
+            width=dp(82),
+        )
+        back.bind(
+            on_release=lambda *_args:
+            App.get_running_app().go("home")
+        )
+
+        title = AppLabel(
+            text="Find your TV",
+            font_size=sp(23),
+            bold=True,
+        )
+
+        top.add_widget(back)
+        top.add_widget(title)
+        root.add_widget(top)
+
+        self.info = AppLabel(
+            text="Search your Wi-Fi network for LG webOS TVs.",
+            role="secondary",
+            size_hint_y=None,
+            height=dp(45),
+        )
+        root.add_widget(self.info)
+
+        action_row = BoxLayout(
+            orientation="horizontal",
+            size_hint_y=None,
+            height=dp(54),
+            spacing=dp(10),
+        )
+
+        self.search = PremiumButton(
+            text="SEARCH FOR TV",
+            accent=True,
+        )
+        self.search.bind(
+            on_release=lambda *_args: self.start_search()
+        )
+
+        self.loader = LoadingIndicator()
+        holder = AnchorLayout(
+            size_hint_x=None,
+            width=dp(45),
+        )
+        holder.add_widget(self.loader)
+
+        action_row.add_widget(self.search)
+        action_row.add_widget(holder)
+        root.add_widget(action_row)
+
+        scroll = ScrollView(
+            do_scroll_x=False,
+            bar_width=dp(3),
+        )
+
+        self.results = BoxLayout(
+            orientation="vertical",
+            size_hint_y=None,
+            spacing=dp(10),
+            padding=[0, dp(4)],
+        )
+        self.results.bind(
+            minimum_height=self.results.setter("height")
+        )
+
+        scroll.add_widget(self.results)
+        root.add_widget(scroll)
+
+        self.add_widget(root)
+
+    def on_enter(self, *_args):
+        if not self.results.children:
+            self.start_search()
+
+    def start_search(self):
+        app = App.get_running_app()
+        if app.discovery_running:
+            return
+
+        self.result_hosts.clear()
+        self.results.clear_widgets()
+        self.loader.active = True
+        self.search.disabled = True
+        self.search.text = "SEARCHING..."
+        self.info.text = "Searching for LG webOS TVs..."
+        app.start_discovery(
+            self.add_result,
+            self.discovery_finished,
+        )
+
+    def add_result(self, host, friendly_name):
+        if host in self.result_hosts:
+            return
+
+        self.result_hosts.add(host)
+
+        card = Surface(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(118),
+            padding=dp(14),
+            spacing=dp(6),
+            opacity=0,
+        )
+
+        card.add_widget(
+            AppLabel(
+                text=friendly_name,
+                font_size=sp(16),
+                bold=True,
+                size_hint_y=None,
+                height=dp(30),
+            )
+        )
+        card.add_widget(
+            AppLabel(
+                text=host,
+                role="secondary",
+                font_size=sp(12),
+                size_hint_y=None,
+                height=dp(24),
+            )
+        )
+
+        connect = PremiumButton(
+            text="CONNECT",
+            accent=True,
+            size_hint_y=None,
+            height=dp(42),
+        )
+        connect.bind(
+            on_release=lambda _btn, h=host, n=friendly_name:
+            self.connect_tv(h, n)
+        )
+
+        card.add_widget(connect)
+        self.results.add_widget(card)
+
+        Animation(
+            opacity=1,
+            duration=Design.NORMAL,
+            t="out_cubic",
+        ).start(card)
+
+    def discovery_finished(self):
+        self.loader.active = False
+        self.search.disabled = False
+        self.search.text = "SEARCH AGAIN"
+
+        if not self.result_hosts:
+            self.info.text = (
+                "No LG webOS TV found. Make sure the phone "
+                "and TV use the same Wi-Fi network."
+            )
+        else:
+            self.info.text = "Select your LG webOS TV."
+
+    def connect_tv(self, host, friendly_name):
+        app = App.get_running_app()
+        app.store.set("last_tv", host)
+        app.store.set("last_tv_name", friendly_name)
+        app.connect_tv(host)
+
+
+class TouchPad(Surface):
+    touched = BooleanProperty(False)
+
+    def __init__(self, **kwargs):
+        kwargs.setdefault("orientation", "vertical")
+        kwargs.setdefault("size_hint_y", None)
+        kwargs.setdefault("height", dp(190))
+        super().__init__(**kwargs)
+
+        self.last_pos = None
+        self.total_movement = 0.0
+        self.touch_uid = None
+
+        self.hint = AppLabel(
+            text="TOUCHPAD",
+            role="muted",
+            halign="center",
+            font_size=sp(12),
+        )
+        self.add_widget(self.hint)
+
+    def on_touch_down(self, touch):
+        if not self.collide_point(*touch.pos):
+            return super().on_touch_down(touch)
+
+        if self.touch_uid is not None:
+            return True
+
+        self.touch_uid = touch.uid
+        touch.grab(self)
+        self.last_pos = touch.pos
+        self.total_movement = 0.0
+        self.touched = True
+
+        app = App.get_running_app()
+        if app:
+            palette = app.theme.palette
+            Animation.cancel_all(self, "border_color")
+            Animation(
+                border_color=palette["accent"],
+                duration=Design.MICRO,
+                t="out_quad",
+            ).start(self)
+
+        return True
+
+    def on_touch_move(self, touch):
+        if touch.grab_current is not self:
+            return super().on_touch_move(touch)
+
+        if touch.uid != self.touch_uid or not self.last_pos:
+            return True
+
+        dx = touch.x - self.last_pos[0]
+        dy = touch.y - self.last_pos[1]
+        self.last_pos = touch.pos
+
+        self.total_movement += abs(dx) + abs(dy)
+
+        if abs(dx) >= 0.5 or abs(dy) >= 0.5:
+            app = App.get_running_app()
+            app.pointer_move(dx * 2.2, -dy * 2.2)
+
+        return True
+
+    def on_touch_up(self, touch):
+        if touch.grab_current is not self:
+            return super().on_touch_up(touch)
+
+        if touch.uid == self.touch_uid:
+            touch.ungrab(self)
+
+            if self.total_movement < dp(12):
+                App.get_running_app().pointer_click()
+
+            self.touch_uid = None
+            self.last_pos = None
+            self.total_movement = 0.0
+            self.touched = False
+
+            app = App.get_running_app()
+            self.apply_theme(
+                app.theme.palette,
+                animated=True,
+            )
+
+        return True
+
+
+class RepeatButton(PremiumButton):
+    remote_key = StringProperty("")
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._hold_event = None
+        self._repeat_event = None
+        self._active_touch = None
+
+    def on_touch_down(self, touch):
+        if (
+            self.disabled
+            or not self.collide_point(*touch.pos)
+            or self._active_touch is not None
+        ):
+            return super().on_touch_down(touch)
+
+        self._active_touch = touch.uid
+        App.get_running_app().remote_button(self.remote_key)
+
+        self._cancel_repeat()
+        self._hold_event = Clock.schedule_once(
+            self._start_repeat,
+            0.38,
+        )
+
+        return super().on_touch_down(touch)
+
+    def _start_repeat(self, _dt):
+        self._hold_event = None
+        if self._active_touch is None:
+            return
+
+        self._repeat_event = Clock.schedule_interval(
+            self._repeat,
             0.12,
         )
 
-        # Reconnect in the background only after the UI is alive.
-        last_tv = self.settings_store.get(
-            "last_tv"
+    def _repeat(self, _dt):
+        if self._active_touch is None:
+            self._cancel_repeat()
+            return False
+
+        App.get_running_app().remote_button(
+            self.remote_key
+        )
+        return True
+
+    def on_touch_up(self, touch):
+        if touch.uid == self._active_touch:
+            self._active_touch = None
+            self._cancel_repeat()
+        return super().on_touch_up(touch)
+
+    def _cancel_repeat(self):
+        if self._hold_event:
+            self._hold_event.cancel()
+            self._hold_event = None
+
+        if self._repeat_event:
+            self._repeat_event.cancel()
+            self._repeat_event = None
+
+    def on_parent(self, _instance, parent):
+        if parent is None:
+            self._active_touch = None
+            self._cancel_repeat()
+class RemoteScreen(AppScreen):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+        root = BoxLayout(
+            orientation="vertical",
+            padding=[dp(16), dp(18), dp(16), dp(12)],
+            spacing=dp(10),
         )
 
-        if (
-            isinstance(last_tv, dict)
-            and last_tv.get("host")
-        ):
-            Clock.schedule_once(
-                lambda dt:
-                    self.lg.connect_async(
-                        last_tv["host"],
-                        last_tv.get("name"),
-                    ),
-                1.55,
-            )
+        header = BoxLayout(
+            orientation="horizontal",
+            size_hint_y=None,
+            height=dp(54),
+            spacing=dp(10),
+        )
 
-        return root
+        title = AppLabel(
+            text="Remote",
+            font_size=sp(25),
+            bold=True,
+        )
 
-    def navigate(
-        self,
-        screen_name,
-    ):
-        manager = self.root_widget.manager
+        self.status = AppLabel(
+            text="Disconnected",
+            role="secondary",
+            font_size=sp(12),
+            halign="right",
+            size_hint_x=0.55,
+        )
 
-        if screen_name not in manager.screen_names:
-            return
+        self.connection_dot = ConnectionIndicator()
 
-        old = manager.current
+        dot_holder = AnchorLayout(
+            size_hint_x=None,
+            width=dp(24),
+        )
+        dot_holder.add_widget(self.connection_dot)
 
-        if old == screen_name:
-            return
+        header.add_widget(title)
+        header.add_widget(self.status)
+        header.add_widget(dot_holder)
 
-        order = {
-            "welcome": 0,
-            "home": 1,
-            "remote": 2,
-            "settings": 2,
-            "discovery": 2,
+        root.add_widget(header)
+
+        power_row = BoxLayout(
+            orientation="horizontal",
+            size_hint_y=None,
+            height=dp(52),
+            spacing=dp(10),
+        )
+
+        self.power_button = PremiumButton(
+            text="POWER",
+            danger=True,
+            size_hint_x=0.34,
+        )
+        self.power_button.bind(
+            on_release=lambda *_args:
+            App.get_running_app().power_off()
+        )
+
+        self.tv_name = AppLabel(
+            text="LG webOS TV",
+            role="secondary",
+            halign="right",
+        )
+
+        power_row.add_widget(self.power_button)
+        power_row.add_widget(self.tv_name)
+
+        root.add_widget(power_row)
+
+        self.touchpad = TouchPad()
+        root.add_widget(self.touchpad)
+
+        dpad_holder = AnchorLayout(
+            size_hint_y=None,
+            height=dp(218),
+        )
+
+        dpad = FloatLayout(
+            size_hint=(None, None),
+            size=(dp(218), dp(205)),
+        )
+
+        button_size = dp(64)
+
+        self.btn_up = RepeatButton(
+            text="UP",
+            remote_key="UP",
+            size_hint=(None, None),
+            size=(button_size, button_size),
+            pos_hint={"center_x": 0.5, "top": 1},
+        )
+
+        self.btn_down = RepeatButton(
+            text="DOWN",
+            remote_key="DOWN",
+            size_hint=(None, None),
+            size=(button_size, button_size),
+            pos_hint={"center_x": 0.5, "y": 0},
+        )
+
+        self.btn_left = RepeatButton(
+            text="LEFT",
+            remote_key="LEFT",
+            size_hint=(None, None),
+            size=(button_size, button_size),
+            pos_hint={"x": 0, "center_y": 0.5},
+        )
+
+        self.btn_right = RepeatButton(
+            text="RIGHT",
+            remote_key="RIGHT",
+            size_hint=(None, None),
+            size=(button_size, button_size),
+            pos_hint={"right": 1, "center_y": 0.5},
+        )
+
+        self.btn_ok = PremiumButton(
+            text="OK",
+            accent=True,
+            size_hint=(None, None),
+            size=(dp(72), dp(72)),
+            pos_hint={"center_x": 0.5, "center_y": 0.5},
+        )
+        self.btn_ok.bind(
+            on_release=lambda *_args:
+            App.get_running_app().remote_button("ENTER")
+        )
+
+        dpad.add_widget(self.btn_up)
+        dpad.add_widget(self.btn_down)
+        dpad.add_widget(self.btn_left)
+        dpad.add_widget(self.btn_right)
+        dpad.add_widget(self.btn_ok)
+
+        dpad_holder.add_widget(dpad)
+        root.add_widget(dpad_holder)
+
+        media_grid = BoxLayout(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(116),
+            spacing=dp(8),
+        )
+
+        first_row = BoxLayout(
+            orientation="horizontal",
+            spacing=dp(8),
+        )
+
+        volume_down = PremiumButton(text="VOL -")
+        volume_up = PremiumButton(text="VOL +")
+        mute = PremiumButton(text="MUTE")
+
+        volume_down.bind(
+            on_release=lambda *_args:
+            App.get_running_app().volume_down()
+        )
+        volume_up.bind(
+            on_release=lambda *_args:
+            App.get_running_app().volume_up()
+        )
+        mute.bind(
+            on_release=lambda *_args:
+            App.get_running_app().toggle_mute()
+        )
+
+        first_row.add_widget(volume_down)
+        first_row.add_widget(volume_up)
+        first_row.add_widget(mute)
+
+        second_row = BoxLayout(
+            orientation="horizontal",
+            spacing=dp(8),
+        )
+
+        back = PremiumButton(text="BACK")
+        home = PremiumButton(text="HOME")
+        play = PremiumButton(text="PLAY")
+
+        back.bind(
+            on_release=lambda *_args:
+            App.get_running_app().remote_button("BACK")
+        )
+        home.bind(
+            on_release=lambda *_args:
+            App.get_running_app().remote_button("HOME")
+        )
+        play.bind(
+            on_release=lambda *_args:
+            App.get_running_app().remote_button("PLAY")
+        )
+
+        second_row.add_widget(back)
+        second_row.add_widget(home)
+        second_row.add_widget(play)
+
+        media_grid.add_widget(first_row)
+        media_grid.add_widget(second_row)
+
+        root.add_widget(media_grid)
+        root.add_widget(NavigationBar(active="remote"))
+
+        self.add_widget(root)
+
+    def on_pre_enter(self, *_args):
+        app = App.get_running_app()
+
+        self.tv_name.text = (
+            app.store.get("last_tv_name", "")
+            or app.store.get("last_tv", "")
+            or "LG webOS TV"
+        )
+
+        self.update_connection(
+            app.connection_state,
+            app.connection_message,
+        )
+
+    def update_connection(self, state, message=""):
+        self.connection_dot.state = state
+
+        state_text = {
+            "disconnected": "Disconnected",
+            "searching": "Searching",
+            "connecting": "Connecting",
+            "connected": "Connected",
+            "error": "Connection error",
         }
 
-        manager.transition.direction = (
-            "left"
-            if order.get(
-                screen_name,
-                1,
-            ) >= order.get(
-                old,
-                1,
-            )
-            else "right"
+        self.status.text = state_text.get(
+            state,
+            "Disconnected",
         )
 
-        manager.current = screen_name
 
-    def toast(
+class SettingsScreen(AppScreen):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+        root = BoxLayout(
+            orientation="vertical",
+            padding=[dp(18), dp(20), dp(18), dp(14)],
+            spacing=dp(12),
+        )
+
+        root.add_widget(
+            AppLabel(
+                text="Settings",
+                font_size=sp(26),
+                bold=True,
+                size_hint_y=None,
+                height=dp(55),
+            )
+        )
+
+        profile = Surface(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(166),
+            padding=dp(16),
+            spacing=dp(10),
+        )
+
+        profile.add_widget(
+            AppLabel(
+                text="Profile",
+                font_size=sp(16),
+                bold=True,
+                size_hint_y=None,
+                height=dp(30),
+            )
+        )
+
+        self.profile_input = PremiumInput(
+            hint_text="Your name",
+        )
+        profile.add_widget(self.profile_input)
+
+        save_profile = PremiumButton(
+            text="SAVE NAME",
+            accent=True,
+        )
+        save_profile.bind(
+            on_release=lambda *_args: self.save_name()
+        )
+
+        profile.add_widget(save_profile)
+        root.add_widget(profile)
+
+        appearance = Surface(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(130),
+            padding=dp(16),
+            spacing=dp(10),
+        )
+
+        appearance.add_widget(
+            AppLabel(
+                text="Appearance",
+                font_size=sp(16),
+                bold=True,
+                size_hint_y=None,
+                height=dp(30),
+            )
+        )
+
+        self.theme_button = PremiumButton(
+            text="SWITCH THEME",
+        )
+        self.theme_button.bind(
+            on_release=lambda *_args: self.toggle_theme()
+        )
+
+        appearance.add_widget(self.theme_button)
+        root.add_widget(appearance)
+
+        television = Surface(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(165),
+            padding=dp(16),
+            spacing=dp(9),
+        )
+
+        television.add_widget(
+            AppLabel(
+                text="Television",
+                font_size=sp(16),
+                bold=True,
+                size_hint_y=None,
+                height=dp(30),
+            )
+        )
+
+        self.selected_tv = AppLabel(
+            text="No TV selected",
+            role="secondary",
+            font_size=sp(13),
+            size_hint_y=None,
+            height=dp(28),
+        )
+        television.add_widget(self.selected_tv)
+
+        actions = BoxLayout(
+            orientation="horizontal",
+            size_hint_y=None,
+            height=dp(50),
+            spacing=dp(8),
+        )
+
+        change = PremiumButton(text="CHANGE TV")
+        reconnect = PremiumButton(
+            text="RECONNECT",
+            accent=True,
+        )
+
+        change.bind(
+            on_release=lambda *_args:
+            App.get_running_app().go("discovery")
+        )
+
+        reconnect.bind(
+            on_release=lambda *_args:
+            App.get_running_app().reconnect()
+        )
+
+        actions.add_widget(change)
+        actions.add_widget(reconnect)
+        television.add_widget(actions)
+
+        root.add_widget(television)
+
+        root.add_widget(Widget())
+        root.add_widget(NavigationBar(active="settings"))
+
+        self.add_widget(root)
+
+    def on_pre_enter(self, *_args):
+        app = App.get_running_app()
+
+        self.profile_input.text = app.store.get("name", "")
+
+        tv_name = app.store.get("last_tv_name", "")
+        host = app.store.get("last_tv", "")
+
+        if tv_name and host:
+            self.selected_tv.text = "{}\n{}".format(
+                tv_name,
+                host,
+            )
+        elif host:
+            self.selected_tv.text = host
+        else:
+            self.selected_tv.text = "No TV selected"
+
+        self._update_theme_text()
+
+    def _update_theme_text(self):
+        app = App.get_running_app()
+
+        if app.theme.mode == "dark":
+            self.theme_button.text = "USE LIGHT THEME"
+        else:
+            self.theme_button.text = "USE DARK THEME"
+
+    def save_name(self):
+        value = self.profile_input.text.strip()
+
+        if not value:
+            App.get_running_app().toast(
+                "Please enter your name.",
+                error=True,
+            )
+            return
+
+        app = App.get_running_app()
+        app.store.set("name", value)
+
+        self.profile_input.focus = False
+        app.toast("Name saved.")
+
+    def toggle_theme(self):
+        app = App.get_running_app()
+        app.theme.toggle()
+        self._update_theme_text()
+
+
+class FahdRemoteApp(App):
+    title = "Fahd LG Remote"
+
+    connection_state = StringProperty("disconnected")
+    connection_message = StringProperty("")
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+        self.store = None
+        self.theme = None
+        self.tv = None
+        self.discovery = None
+
+        self.executor = None
+
+        self.discovery_running = False
+
+        self.manager = None
+        self.toast_layer = None
+
+        self._shutting_down = False
+        self._connection_generation = 0
+
+        self._pointer_lock = threading.Lock()
+        self._pending_dx = 0.0
+        self._pending_dy = 0.0
+        self._pointer_flush_scheduled = False
+
+    def build(self):
+        Window.clearcolor = Design.DARK["background"]
+
+        try:
+            Window.softinput_mode = "below_target"
+        except Exception:
+            pass
+
+        config_file = os.path.join(
+            self.user_data_dir,
+            "settings.json",
+        )
+
+        self.store = SettingsStore(config_file)
+        self.theme = ThemeManager(self.store)
+
+        self.executor = ThreadPoolExecutor(
+            max_workers=3,
+            thread_name_prefix="FahdRemote",
+        )
+
+        self.tv = WebOSTV(
+            self.store,
+            self._on_connection_state,
+        )
+
+        self.discovery = SSDPDiscovery()
+
+        main = FloatLayout()
+
+        self.manager = ScreenManager(
+            transition=FadeTransition(
+                duration=Design.SCREEN
+            )
+        )
+
+        self.manager.add_widget(
+            SplashScreen(name="splash")
+        )
+        self.manager.add_widget(
+            WelcomeScreen(name="welcome")
+        )
+        self.manager.add_widget(
+            HomeScreen(name="home")
+        )
+        self.manager.add_widget(
+            DiscoveryScreen(name="discovery")
+        )
+        self.manager.add_widget(
+            RemoteScreen(name="remote")
+        )
+        self.manager.add_widget(
+            SettingsScreen(name="settings")
+        )
+
+        main.add_widget(self.manager)
+
+        self.toast_layer = Toast()
+        main.add_widget(self.toast_layer)
+
+        self.manager.current = "splash"
+
+        Clock.schedule_once(
+            self._attempt_saved_connection,
+            1.4,
+        )
+
+        return main
+
+    def _attempt_saved_connection(self, _dt):
+        host = self.store.get("last_tv", "").strip()
+
+        if host and self.connection_state != "connected":
+            self.connect_tv(
+                host,
+                quiet=True,
+            )
+
+    def go(self, screen_name):
+        if not self.manager:
+            return
+
+        if screen_name not in self.manager.screen_names:
+            return
+
+        if self.manager.current == screen_name:
+            return
+
+        self.manager.current = screen_name
+
+    def toast(self, message, error=False):
+        if not self.toast_layer:
+            return
+
+        self.toast_layer.show(
+            str(message),
+            error=error,
+        )
+
+    def _on_connection_state(self, state, message=""):
+        self.connection_state = state
+        self.connection_message = message
+
+        if not self.manager:
+            return
+
+        home = self.manager.get_screen("home")
+        remote = self.manager.get_screen("remote")
+
+        home.update_connection(state, message)
+        remote.update_connection(state, message)
+
+    def start_discovery(
         self,
-        message,
+        result_callback,
+        done_callback,
     ):
-        if self.root_widget:
-            self.root_widget.toast_layer.show(
-                message
-            )
+        if self.discovery_running:
+            return
 
-    def start_discovery(self):
-        self.navigate(
-            "discovery"
+        self.discovery_running = True
+
+        self._on_connection_state(
+            "searching",
+            "Searching for LG webOS TVs",
         )
 
-        self.discovery.start_search_ui()
+        self.discovery.stop()
+        self.discovery = SSDPDiscovery()
 
-        self.home.tv_card.update(
-            "searching"
+        def finished():
+            self.discovery_running = False
+
+            if self.tv.connected:
+                self._on_connection_state(
+                    "connected",
+                    "Connected",
+                )
+            else:
+                self._on_connection_state(
+                    "disconnected",
+                    "Disconnected",
+                )
+
+            done_callback()
+
+        self.executor.submit(
+            self.discovery.discover,
+            result_callback,
+            finished,
+            4.5,
+        )
+
+    @staticmethod
+    def _valid_host(host):
+        if not host:
+            return False
+
+        value = str(host).strip()
+
+        if not value or len(value) > 255:
+            return False
+
+        try:
+            socket.inet_aton(value)
+            return value.count(".") == 3
+        except OSError:
+            pass
+
+        allowed = set(
+            "abcdefghijklmnopqrstuvwxyz"
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            "0123456789.-"
+        )
+
+        return all(char in allowed for char in value)
+
+    def connect_tv(
+        self,
+        host,
+        friendly_name=None,
+        quiet=False,
+    ):
+        host = str(host).strip()
+
+        if not self._valid_host(host):
+            self.toast(
+                "Invalid TV address.",
+                error=True,
+            )
+            return
+
+        self._connection_generation += 1
+        generation = self._connection_generation
+
+        if friendly_name:
+            self.store.set(
+                "last_tv_name",
+                friendly_name,
+            )
+
+        self.store.set("last_tv", host)
+
+        self._on_connection_state(
+            "connecting",
+            "Connecting",
         )
 
         def worker():
             try:
-                devices = LGWebOSClient.discover(
-                    timeout=3.5
+                result = self.tv.connect(host)
+
+                if generation != self._connection_generation:
+                    return
+
+                if result:
+                    Clock.schedule_once(
+                        lambda _dt: self._connected_ui(
+                            quiet
+                        ),
+                        0,
+                    )
+                elif not quiet:
+                    Clock.schedule_once(
+                        lambda _dt: self.toast(
+                            "Could not connect to the TV.",
+                            error=True,
+                        ),
+                        0,
+                    )
+
+            except Exception as exc:
+                if generation != self._connection_generation:
+                    return
+
+                Clock.schedule_once(
+                    lambda _dt, error=str(exc):
+                    self._connection_failed(
+                        error,
+                        quiet,
+                    ),
+                    0,
                 )
 
-            except Exception:
-                devices = []
+        self.executor.submit(worker)
 
-            ui(
-                self.discovery_finished,
-                devices,
-            )
+    def _connected_ui(self, quiet=False):
+        if not quiet:
+            self.toast("Connected to LG webOS TV.")
 
-        threading.Thread(
-            target=worker,
-            daemon=True,
-            name="lg-discovery",
-        ).start()
+        if (
+            self.manager
+            and self.manager.current == "discovery"
+        ):
+            self.go("remote")
 
-    def discovery_finished(
+    def _connection_failed(
         self,
-        devices,
+        error,
+        quiet=False,
     ):
-        self.discovery.display_results(
-            devices
+        self._on_connection_state(
+            "error",
+            error,
         )
 
-        if not self.lg.connected:
-            self.home.tv_card.update(
-                "disconnected"
+        if not quiet:
+            self.toast(
+                "Connection failed: {}".format(error),
+                error=True,
             )
 
-    def on_tv_state(
+    def reconnect(self):
+        host = self.store.get("last_tv", "").strip()
+
+        if not host:
+            self.toast(
+                "Select a TV first.",
+                error=True,
+            )
+            self.go("discovery")
+            return
+
+        self.connect_tv(host)
+
+    def _submit_command(
         self,
-        state,
-        message,
+        function,
+        *args,
+        show_error=True
     ):
-        self.home.tv_card.update(
-            state,
-            message,
+        if not self.tv.connected:
+            if show_error:
+                self.toast(
+                    "Connect to your TV first.",
+                    error=True,
+                )
+            return
+
+        def worker():
+            try:
+                function(*args)
+            except Exception as exc:
+                if show_error:
+                    Clock.schedule_once(
+                        lambda _dt, error=str(exc):
+                        self.toast(
+                            "TV command failed: {}".format(
+                                error
+                            ),
+                            error=True,
+                        ),
+                        0,
+                    )
+
+        self.executor.submit(worker)
+
+    def remote_button(self, key):
+        self._submit_command(
+            self.tv.button,
+            key,
+            show_error=False,
         )
 
-        if state == "connected":
-            self.toast(
-                "TV connected."
-            )
+    def pointer_click(self):
+        self._submit_command(
+            self.tv.click,
+            show_error=False,
+        )
 
-        elif state == "connecting":
-            # Pairing prompt may appear on the physical TV.
-            pass
+    def pointer_move(self, dx, dy):
+        if not self.tv.connected:
+            return
 
-        elif state == "error":
-            self.toast(
-                message
-            )
+        with self._pointer_lock:
+            self._pending_dx += dx
+            self._pending_dy += dy
 
-        elif state == "disconnected":
-            pass
+            if self._pointer_flush_scheduled:
+                return
+
+            self._pointer_flush_scheduled = True
+
+        Clock.schedule_once(
+            self._flush_pointer,
+            1.0 / 45.0,
+        )
+
+    def _flush_pointer(self, _dt):
+        with self._pointer_lock:
+            dx = self._pending_dx
+            dy = self._pending_dy
+
+            self._pending_dx = 0.0
+            self._pending_dy = 0.0
+            self._pointer_flush_scheduled = False
+
+        if not self.tv.connected:
+            return
+
+        if abs(dx) < 0.1 and abs(dy) < 0.1:
+            return
+
+        self._submit_command(
+            self.tv.move_pointer,
+            dx,
+            dy,
+            show_error=False,
+        )
+
+    def volume_up(self):
+        self._submit_command(
+            self.tv.volume_up
+        )
+
+    def volume_down(self):
+        self._submit_command(
+            self.tv.volume_down
+        )
+
+    def toggle_mute(self):
+        self._submit_command(
+            self.tv.toggle_mute
+        )
+
+    def power_off(self):
+        self._submit_command(
+            self.tv.power_off
+        )
 
     def on_pause(self):
-        # Android can pause the Activity without actually terminating it.
         return True
 
-    def on_stop(self):
-        try:
-            self.lg.disconnect(
-                emit=False
+    def on_resume(self):
+        if (
+            self.store
+            and self.connection_state != "connected"
+        ):
+            Clock.schedule_once(
+                self._attempt_saved_connection,
+                0.6,
             )
+
+    def on_stop(self):
+        if self._shutting_down:
+            return
+
+        self._shutting_down = True
+        self._connection_generation += 1
+
+        try:
+            if self.discovery:
+                self.discovery.stop()
+        except Exception:
+            pass
+
+        try:
+            if self.tv:
+                self.tv.disconnect(
+                    notify=False
+                )
+        except Exception:
+            pass
+
+        try:
+            if self.executor:
+                self.executor.shutdown(
+                    wait=False,
+                    cancel_futures=True,
+                )
         except Exception:
             pass
 
 
 if __name__ == "__main__":
-    AetherRemoteApp().run()
+    FahdRemoteApp().run()
+
+
+
+
+
+    
